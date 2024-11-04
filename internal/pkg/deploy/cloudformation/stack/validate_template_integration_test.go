@@ -6,7 +6,8 @@
 package stack_test
 
 import (
-	"io/ioutil"
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -17,12 +18,14 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/workspace"
+	"github.com/spf13/afero"
 	"github.com/stretchr/testify/require"
 )
 
 func TestAutoscalingIntegration_Validate(t *testing.T) {
 	path := filepath.Join("testdata", "stacklocal", autoScalingManifestPath)
-	wantedManifestBytes, err := ioutil.ReadFile(path)
+	wantedManifestBytes, err := os.ReadFile(path)
 	require.NoError(t, err)
 	mft, err := manifest.UnmarshalWorkload(wantedManifestBytes)
 	require.NoError(t, err)
@@ -30,8 +33,19 @@ func TestAutoscalingIntegration_Validate(t *testing.T) {
 	v, ok := content.(*manifest.LoadBalancedWebService)
 	require.Equal(t, ok, true)
 
-	addons, err := addon.New(aws.StringValue(v.Name))
+	// Create in-memory mock file system.
+	wd, err := os.Getwd()
 	require.NoError(t, err)
+	fs := afero.NewMemMapFs()
+	_ = fs.MkdirAll(fmt.Sprintf("%s/copilot", wd), 0755)
+	_ = afero.WriteFile(fs, fmt.Sprintf("%s/copilot/.workspace", wd), []byte(fmt.Sprintf("---\napplication: %s", "DavidsApp")), 0644)
+	require.NoError(t, err)
+	ws, err := workspace.Use(fs)
+	require.NoError(t, err)
+
+	_, err = addon.ParseFromWorkload(aws.StringValue(v.Name), ws)
+	var notFound *addon.ErrAddonsNotFound
+	require.ErrorAs(t, err, &notFound)
 
 	serializer, err := stack.NewLoadBalancedWebService(stack.LoadBalancedWebServiceConfig{
 		App: &config.Application{Name: appName},
@@ -42,9 +56,11 @@ func TestAutoscalingIntegration_Validate(t *testing.T) {
 		},
 		Manifest: v,
 		RuntimeConfig: stack.RuntimeConfig{
-			Image: &stack.ECRImage{
-				RepoURL:  imageURL,
-				ImageTag: imageTag,
+			PushedImages: map[string]stack.ECRImage{
+				aws.StringValue(v.Name): {
+					RepoURL:  imageURL,
+					ImageTag: imageTag,
+				},
 			},
 			ServiceDiscoveryEndpoint: "test.app.local",
 			CustomResourcesURL: map[string]string{
@@ -52,8 +68,9 @@ func TestAutoscalingIntegration_Validate(t *testing.T) {
 				"DynamicDesiredCountFunction": "https://my-bucket.s3.us-west-2.amazonaws.com/code.zip",
 				"RulePriorityFunction":        "https://my-bucket.s3.us-west-2.amazonaws.com/code.zip",
 			},
+			EnvVersion: "v1.42.0",
+			Version:    "v1.29.0",
 		},
-		Addons: addons,
 	})
 	require.NoError(t, err)
 	tpl, err := serializer.Template()
@@ -72,7 +89,7 @@ func TestAutoscalingIntegration_Validate(t *testing.T) {
 
 func TestScheduledJob_Validate(t *testing.T) {
 	path := filepath.Join("testdata", "workloads", jobManifestPath)
-	manifestBytes, err := ioutil.ReadFile(path)
+	manifestBytes, err := os.ReadFile(path)
 	require.NoError(t, err)
 	mft, err := manifest.UnmarshalWorkload(manifestBytes)
 	require.NoError(t, err)
@@ -80,11 +97,24 @@ func TestScheduledJob_Validate(t *testing.T) {
 	v, ok := content.(*manifest.ScheduledJob)
 	require.True(t, ok)
 
-	addons, err := addon.New(aws.StringValue(v.Name))
+	// Create in-memory mock file system.
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	fs := afero.NewMemMapFs()
+	_ = fs.MkdirAll(fmt.Sprintf("%s/copilot", wd), 0755)
+	_ = afero.WriteFile(fs, fmt.Sprintf("%s/copilot/.workspace", wd), []byte(fmt.Sprintf("---\napplication: %s", "DavidsApp")), 0644)
+	require.NoError(t, err)
+	ws, err := workspace.Use(fs)
 	require.NoError(t, err)
 
+	_, err = addon.ParseFromWorkload(aws.StringValue(v.Name), ws)
+	var notFound *addon.ErrAddonsNotFound
+	require.ErrorAs(t, err, &notFound)
+
 	serializer, err := stack.NewScheduledJob(stack.ScheduledJobConfig{
-		App:      appName,
+		App: &config.Application{
+			Name: appName,
+		},
 		Env:      envName,
 		Manifest: v,
 		RuntimeConfig: stack.RuntimeConfig{
@@ -92,8 +122,11 @@ func TestScheduledJob_Validate(t *testing.T) {
 			CustomResourcesURL: map[string]string{
 				"EnvControllerFunction": "https://my-bucket.s3.us-west-2.amazonaws.com/code.zip",
 			},
+			AccountID:  "123456789123",
+			Region:     "us-west-2",
+			EnvVersion: "v1.42.0",
+			Version:    "v1.29.0",
 		},
-		Addons: addons,
 	})
 
 	tpl, err := serializer.Template()

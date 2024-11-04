@@ -25,6 +25,9 @@ sidecars:
 ```
 This example will provision 100 GiB of storage to be shared between the sidecar and the task container. This can be useful for large datasets, or for using a sidecar to transfer data from EFS into task storage for workloads with high disk I/O requirements.
 
+<span class="parent-field">storage.</span><a id="storage-readonlyfs" href="#storage-readonlyfs" class="field">`readonly_fs`</a> <span class="type">Boolean</span>
+Specify true to give your container read-only access to its root file system.
+
 <span class="parent-field">storage.</span><a id="volumes" href="#volumes" class="field">`volumes`</a> <span class="type">Map</span>  
 Specify the name and configuration of any EFS volumes you would like to attach. The `volumes` field is specified as a map of the form:
 ```yaml
@@ -59,6 +62,9 @@ efs:
 
 <span class="parent-field">storage.volumes.`<volume>`.efs.</span><a id="id" href="#id" class="field">`id`</a> <span class="type">String</span>  
 Required. The ID of the filesystem you would like to mount.
+
+<span class="parent-field">storage.volumes.`<volume>`.efs.id.</span><a id="from_cfn" href="#from_cfn" class="field">`from_cfn`</a> <span class="type">String</span> <span class="version">Added in [v1.30.0](../../blogs/release-v130.en.md#deployment-actions)</span>  
+The name of a [CloudFormation stack export](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-stack-exports.html).
 
 <span class="parent-field">storage.volumes.`<volume>`.efs.</span><a id="root_dir" href="#root-dir" class="field">`root_dir`</a> <span class="type">String</span>  
 Optional. Defaults to `/`. Specify the location in the EFS filesystem you would like to use as the root of your volume. Must be fewer than 255 characters and must consist only of the characters `a-zA-Z0-9.-_/`. If using an access point, `root_dir` must be either empty or `/` and `auth.iam` must be `true`.

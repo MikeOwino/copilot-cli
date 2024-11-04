@@ -21,8 +21,33 @@ Copilot の Manifest でサイドカーを追加したい場合、[サイドカ�
 
 <div class="separator"></div>
 
-## 実行例
+#### 実行例
 
+##### サイドカーでの Environment オーバーライド
+他の Service / Job の Manifest と同様に、サイドカー設定も [`environments`](../manifest/lb-web-service.ja.md#environments) フィールドを利用して環境ごとにオーバーライドできます。
+次の例では、`datadog` サイドカーの環境変数 `DD_APM_ENABLED` の値を、`dev` Environment かどうかによって設定しています。
+
+```yaml
+name: api
+type: Load Balanced Web Service
+
+sidecars:
+  datadog:
+    port: 80
+    image:
+      build: src/reverseproxy/Dockerfile
+    variables:
+      DD_APM_ENABLED: true
+
+environments:
+  dev:
+    sidecars:
+      datadog:
+        variables:
+          DD_APM_ENABLED: false
+```
+
+##### [nginx](https://www.nginx.com/) サイドカーコンテナ
 以下は Load Balanced Web Service の Manifest で [nginx](https://www.nginx.com/) サイドカーコンテナを指定する例です。
 
 ``` yaml
@@ -37,7 +62,7 @@ http:
   path: 'api'
   healthcheck: '/api/health-check'
   # ロードバランサーのターゲットコンテナは Service のコンテナの代わりにサイドカーの'nginx'を指定しています。
-  targetContainer: 'nginx'
+  target_container: 'nginx'
 
 cpu: 256
 memory: 512
@@ -46,12 +71,13 @@ count: 1
 sidecars:
   nginx:
     port: 80
-    image: 1234567890.dkr.ecr.us-west-2.amazonaws.com/reverse-proxy:revision_1
+    image:
+      build: src/reverseproxy/Dockerfile
     variables:
       NGINX_PORT: 80
 ```
 
-以下は Service とサイドカーコンテナ両方で EFS ボリュームを用いる Manifest の一部です。
+##### Service とサイドカーコンテナ両方で EFS ボリュームを利用
 
 ```yaml
 storage:
@@ -73,6 +99,7 @@ sidecars:
         path: '/etc/mount1'
 ```
 
+##### [AWS Distro for OpenTelemetry](https://aws-otel.github.io/) サイドカー
 以下は、[AWS Distro for OpenTelemetry](https://aws-otel.github.io/) のサイドカーをカスタム構成で実行した例です。このカスタム構成例では、X-Ray トレースデータを収集するだけでなく、ECS メトリクスをサードパーティに送信することができます。この例では、SSM シークレットと追加の IAM 権限が必要になります。
 
 OpenTelemetry サイドカーを使用するには、まず有効な[設定ファイル](https://opentelemetry.io/docs/collector/configuration/)を作成します。次に、設定ファイルのサイズを確認します。標準的なパラメータは [4KB に制限](https://docs.aws.amazon.com/ja_jp/systems-manager/latest/APIReference/API_PutParameter.html#systemsmanager-PutParameter-request-Value)されています。設定ファイルが 4K より大きい場合、高度な SSM パラメータを使用する必要があります。
@@ -110,7 +137,7 @@ service:
       exporters: [otlp]
 ```
 
-X-Ray トレースの書き込みには、以下のような追加の IAM 権限が必要です。[公開されているドキュメント](../developing/additional-aws-resources.ja.md)に従ってこれを Addon に含めてください。
+X-Ray トレースの書き込みには、以下のような追加の IAM 権限が必要です。[公開されているドキュメント](./addons/workload.ja.md)に従ってこれを Addon に含めてください。
 
 ``` yaml
 Resources:
@@ -181,7 +208,7 @@ logging:
     log_stream_prefix: copilot/
 ```
 
-FireLens がログを転送するためにタスクロールに対して必要なアクセス許可を追加で与える必要があるかもしれません。[Addon](../developing/additional-aws-resources.ja.md) のなかで許可を追加できます。例えば以下のように設定できます。
+FireLens がログを転送するためにタスクロールに対して必要なアクセス許可を追加で与える必要があるかもしれません。[Addon](./addons/workload.ja.md) のなかで許可を追加できます。例えば以下のように設定できます。
 
 ``` yaml
 Resources:
@@ -206,6 +233,3 @@ Outputs:
 
 !!!info
     FireLens ログドライバーは主となるコンテナのログを様々な宛先へルーティングできる一方で、 [`svc logs`](../commands/svc-logs.ja.md) コマンドは CloudWatch Logs で Copilot Service のために作成したロググループに送信された場合のみログをトラックできます。
-
-!!!info
-    ** この機能をより簡単かつパワフルにする予定です！**現時点ではサイドカーはリモートイメージの利用のみをサポートしており、ユーザーはローカルのサイドカーイメージをビルドしてプッシュする必要があります。しかしローカルのイメージや Dockerfile をサポートする予定です。さらに FireLens 自身については主となるコンテナだけでなく他のサイドカーのログもルーティングできるようになる予定です。

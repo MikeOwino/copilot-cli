@@ -6,7 +6,10 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
+
 	"github.com/aws/copilot-cli/internal/pkg/aws/s3"
+	"github.com/spf13/afero"
 
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
@@ -51,6 +54,7 @@ type deleteTaskVars struct {
 
 type deleteTaskOpts struct {
 	deleteTaskVars
+	wsAppName string
 
 	// Dependencies to interact with other modules
 	store    store
@@ -72,9 +76,9 @@ type deleteTaskOpts struct {
 }
 
 func newDeleteTaskOpts(vars deleteTaskVars) (*deleteTaskOpts, error) {
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
+		return nil, err
 	}
 
 	sessProvider := sessions.ImmutableProvider(sessions.UserAgentExtras("task delete"))
@@ -87,21 +91,22 @@ func newDeleteTaskOpts(vars deleteTaskVars) (*deleteTaskOpts, error) {
 	prompter := prompt.New()
 	return &deleteTaskOpts{
 		deleteTaskVars: vars,
+		wsAppName:      tryReadingAppName(),
 
 		store:    store,
 		spinner:  termprogress.NewSpinner(log.DiagnosticWriter),
 		prompt:   prompter,
 		provider: sessProvider,
-		sel:      selector.NewLocalWorkloadSelector(prompter, store, ws),
+		sel:      selector.NewLocalWorkloadSelector(prompter, store, ws, selector.OnlyInitializedWorkloads),
 		newTaskSel: func(session *session.Session) cfTaskSelector {
-			cfn := cloudformation.New(session)
+			cfn := cloudformation.New(session, cloudformation.WithProgressTracker(os.Stderr))
 			return selector.NewCFTaskSelect(prompter, store, cfn)
 		},
 		newTaskStopper: func(session *session.Session) taskStopper {
 			return ecs.New(session)
 		},
 		newStackManager: func(session *session.Session) taskStackManager {
-			return cloudformation.New(session)
+			return cloudformation.New(session, cloudformation.WithProgressTracker(os.Stderr))
 		},
 		newImageRemover: func(session *session.Session) imageRemover {
 			return ecr.New(session)
@@ -178,7 +183,7 @@ func (o *deleteTaskOpts) validateFlagsWithDefaultCluster() error {
 	// The app flag defaults to the WS app so there's an edge case where it's possible to specify
 	// `copilot task delete --app ws-app --default` and not error out, but this should be taken as
 	// specifying "default".
-	if o.app != tryReadingAppName() {
+	if o.app != o.wsAppName {
 		return fmt.Errorf("cannot specify both `--app` and `--default`")
 	}
 
@@ -223,7 +228,7 @@ func (o *deleteTaskOpts) askEnvName() error {
 	if o.env != "" {
 		return nil
 	}
-	env, err := o.sel.Environment(taskDeleteEnvPrompt, "", o.app, appEnvOptionNone)
+	env, err := o.sel.Environment(taskDeleteEnvPrompt, "", o.app, prompt.Option{Value: appEnvOptionNone})
 	if err != nil {
 		return fmt.Errorf("select environment: %w", err)
 	}

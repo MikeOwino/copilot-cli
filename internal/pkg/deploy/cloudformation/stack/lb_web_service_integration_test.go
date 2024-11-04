@@ -7,16 +7,19 @@ package stack_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/copilot-cli/internal/pkg/addon"
+	"github.com/aws/copilot-cli/internal/pkg/aws/elbv2"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
+	"github.com/aws/copilot-cli/internal/pkg/workspace"
+	"github.com/spf13/afero"
 	"gopkg.in/yaml.v3"
 
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
@@ -28,16 +31,36 @@ const (
 	svcManifestPath = "svc-manifest.yml"
 )
 
-func TestLoadBalancedWebService_Template(t *testing.T) {
+func TestLoadBalancedWebService_TemplateInteg(t *testing.T) {
 	testCases := map[string]struct {
 		envName       string
 		svcStackPath  string
 		svcParamsPath string
+		mockImportALB *elbv2.LoadBalancer
 	}{
 		"default env": {
 			envName:       "test",
 			svcStackPath:  "svc-test.stack.yml",
 			svcParamsPath: "svc-test.params.json",
+			mockImportALB: &elbv2.LoadBalancer{
+				ARN:     "mockImportALBARN",
+				Name:    "mockImportALBName",
+				DNSName: "mockImportALBDNSName",
+				Listeners: []elbv2.Listener{
+					{
+						ARN:      "MockListenerARN1",
+						Port:     80,
+						Protocol: "HTTPS",
+					},
+					{
+						ARN:      "MockListenerARN1",
+						Port:     443,
+						Protocol: "HTTP",
+					},
+				},
+				SecurityGroups: []string{"mockImportALBSG1", "mockImportALBSG2"},
+				HostedZoneID:   "mockHostedZoneID",
+			},
 		},
 		"staging env": {
 			envName:       "staging",
@@ -60,7 +83,7 @@ func TestLoadBalancedWebService_Template(t *testing.T) {
 		require.NoError(t, os.Setenv("TAG", val))
 	}()
 	path := filepath.Join("testdata", "workloads", svcManifestPath)
-	manifestBytes, err := ioutil.ReadFile(path)
+	manifestBytes, err := os.ReadFile(path)
 	require.NoError(t, err)
 	for name, tc := range testCases {
 		interpolated, err := manifest.NewInterpolator(appName, tc.envName).Interpolate(string(manifestBytes))
@@ -71,13 +94,27 @@ func TestLoadBalancedWebService_Template(t *testing.T) {
 		require.NoError(t, err)
 		err = envMft.Validate()
 		require.NoError(t, err)
+		err = envMft.Load(session.New())
+		require.NoError(t, err)
 		content := envMft.Manifest()
 
 		v, ok := content.(*manifest.LoadBalancedWebService)
 		require.True(t, ok)
 
-		addons, err := addon.New(aws.StringValue(v.Name))
+		// Create in-memory mock file system.
+		wd, err := os.Getwd()
 		require.NoError(t, err)
+		fs := afero.NewMemMapFs()
+		_ = fs.MkdirAll(fmt.Sprintf("%s/copilot", wd), 0755)
+		_ = afero.WriteFile(fs, fmt.Sprintf("%s/copilot/.workspace", wd), []byte(fmt.Sprintf("---\napplication: %s", "DavidsApp")), 0644)
+		require.NoError(t, err)
+
+		ws, err := workspace.Use(fs)
+		require.NoError(t, err)
+
+		_, err = addon.ParseFromWorkload(aws.StringValue(v.Name), ws)
+		var notFound *addon.ErrAddonsNotFound
+		require.ErrorAs(t, err, &notFound)
 
 		svcDiscoveryEndpointName := fmt.Sprintf("%s.%s.local", tc.envName, appName)
 		envConfig := &manifest.Environment{
@@ -86,17 +123,25 @@ func TestLoadBalancedWebService_Template(t *testing.T) {
 			},
 		}
 		envConfig.HTTPConfig.Public.Certificates = []string{"mockCertARN"}
+		var opts []stack.LoadBalancedWebServiceOption
+		if tc.mockImportALB != nil {
+			opts = append(opts, stack.WithImportedALB(tc.mockImportALB))
+		}
 		serializer, err := stack.NewLoadBalancedWebService(stack.LoadBalancedWebServiceConfig{
-			App:         &config.Application{Name: appName},
-			EnvManifest: envConfig,
-			Manifest:    v,
+			App:                &config.Application{Name: appName},
+			EnvManifest:        envConfig,
+			Manifest:           v,
+			ArtifactBucketName: "bucket",
+			ArtifactKey:        "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab",
 			RuntimeConfig: stack.RuntimeConfig{
 				ServiceDiscoveryEndpoint: svcDiscoveryEndpointName,
 				AccountID:                "123456789123",
 				Region:                   "us-west-2",
+				EnvVersion:               "v1.42.0",
+				Version:                  "v1.29.0",
 			},
-			Addons: addons,
-		})
+		}, opts...)
+		require.NoError(t, err, "stack should be able to be initialized")
 		tpl, err := serializer.Template()
 		require.NoError(t, err, "template should render")
 		regExpGUID := regexp.MustCompile(`([a-f\d]{8}-)([a-f\d]{4}-){3}([a-f\d]{12})`) // Matches random guids
@@ -109,12 +154,14 @@ func TestLoadBalancedWebService_Template(t *testing.T) {
 			mActual := make(map[interface{}]interface{})
 			require.NoError(t, yaml.Unmarshal(actualBytes, mActual))
 
-			expected, err := ioutil.ReadFile(filepath.Join("testdata", "workloads", tc.svcStackPath))
+			expected, err := os.ReadFile(filepath.Join("testdata", "workloads", tc.svcStackPath))
 			require.NoError(t, err, "should be able to read expected bytes")
 			expectedBytes := []byte(expected)
 			mExpected := make(map[interface{}]interface{})
 			require.NoError(t, yaml.Unmarshal(expectedBytes, mExpected))
-			require.Equal(t, mExpected, mActual)
+
+			resetCustomResourceLocations(mActual)
+			compareStackTemplate(t, mExpected, mActual)
 		})
 
 		testName = fmt.Sprintf("Parameter values should render properly/%s", name)
@@ -123,7 +170,7 @@ func TestLoadBalancedWebService_Template(t *testing.T) {
 			require.NoError(t, err)
 
 			path := filepath.Join("testdata", "workloads", tc.svcParamsPath)
-			wantedCFNParamsBytes, err := ioutil.ReadFile(path)
+			wantedCFNParamsBytes, err := os.ReadFile(path)
 			require.NoError(t, err)
 
 			require.Equal(t, string(wantedCFNParamsBytes), actualParams)

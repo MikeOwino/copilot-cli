@@ -89,7 +89,7 @@ Resources:
   {{- if eq .ExecutionRole "" }}
   DefaultExecutionRole:
     Metadata:
-      'aws:copilot:description': 'An IAM Role for the Fargate agent to make AWS API calls on your behalf'
+      'aws:copilot:description': 'An IAM Role {{- if .PermissionsBoundary}} with permissions boundary {{.PermissionsBoundary}} {{- end}} for the Fargate agent to make AWS API calls on your behalf'
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -101,6 +101,9 @@ Resources:
             Action: 'sts:AssumeRole'
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      {{- if .PermissionsBoundary}}
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/{{.PermissionsBoundary}}'
+      {{- end}}
       Policies:
         - !If
           # Optional IAM permission required by ECS task def env file
@@ -195,7 +198,7 @@ Resources:
 
   DefaultTaskRole:
     Metadata:
-      'aws:copilot:description': 'An IAM Role for the task to make AWS API calls on your behalf. Policies are required by ECS Exec'
+      'aws:copilot:description': 'An IAM Role {{- if .PermissionsBoundary}} with permissions boundary {{.PermissionsBoundary}} {{- end}} for the task to make AWS API calls on your behalf. Policies are required by ECS Exec'
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -205,6 +208,9 @@ Resources:
             Principal:
               Service: ecs-tasks.amazonaws.com
             Action: 'sts:AssumeRole'
+      {{- if .PermissionsBoundary}}
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/{{.PermissionsBoundary}}'
+      {{- end}}
       Policies:
         - PolicyName: 'ExecuteCommand'
           PolicyDocument:
@@ -267,6 +273,11 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
           # .env files are only needed on the initial RunTask call and are not needed after that.
@@ -275,6 +286,9 @@ Resources:
             Status: Enabled
             Prefix: 'manual/env-files'
             ExpirationInDays: 1
+            NoncurrentVersionExpirationInDays: 1 # Permanently delete noncurrent versions of objects
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
   S3BucketPolicy:
     Metadata:
       'aws:copilot:description': 'A policy to allow file uploads to the S3 bucket'
@@ -294,6 +308,11 @@ Resources:
             Principal:
               AWS:
                 - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+              {{- if and .App .Env }}
+              AWS:
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/{{ .App }}-{{ .Env }}-EnvManagerRole'
+              {{- end}}
+
 Outputs:
   ECRRepo:
     Description: ECR Repo used to store images of task.

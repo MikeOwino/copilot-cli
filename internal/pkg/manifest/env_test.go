@@ -278,11 +278,6 @@ func TestFromEnvConfig(t *testing.T) {
 						Private: privateHTTPConfig{
 							InternalALBSubnets: []string{"subnet2"},
 							Certificates:       []string{"arn:aws:acm:region:account:certificate/certificate_ID_1", "arn:aws:acm:region:account:certificate/certificate_ID_2"},
-							SecurityGroupsConfig: securityGroupsConfig{
-								Ingress: Ingress{
-									VPCIngress: aws.Bool(false),
-								},
-							},
 						},
 					},
 				},
@@ -386,6 +381,57 @@ network:
 				},
 			},
 		},
+		"unmarshal with enable access logs": {
+			inContent: `name: prod
+type: Environment
+
+http:
+  public:
+    access_logs: true`,
+			wantedStruct: &Environment{
+				Workload: Workload{
+					Name: aws.String("prod"),
+					Type: aws.String("Environment"),
+				},
+				EnvironmentConfig: EnvironmentConfig{
+					HTTPConfig: EnvironmentHTTPConfig{
+						Public: PublicHTTPConfig{
+							ELBAccessLogs: ELBAccessLogsArgsOrBool{
+								Enabled: aws.Bool(true),
+							},
+						},
+					},
+				},
+			},
+		},
+		"unmarshal with advanced access logs": {
+			inContent: `name: prod
+type: Environment
+
+http:
+  public:
+    access_logs:
+      bucket_name: testbucket
+      prefix: prefix`,
+			wantedStruct: &Environment{
+				Workload: Workload{
+					Name: aws.String("prod"),
+					Type: aws.String("Environment"),
+				},
+				EnvironmentConfig: EnvironmentConfig{
+					HTTPConfig: EnvironmentHTTPConfig{
+						Public: PublicHTTPConfig{
+							ELBAccessLogs: ELBAccessLogsArgsOrBool{
+								AdvancedConfig: ELBAccessLogsArgs{
+									Prefix:     aws.String("prefix"),
+									BucketName: aws.String("testbucket"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 		"unmarshal with observability": {
 			inContent: `name: prod
 type: Environment
@@ -417,7 +463,7 @@ cdn: true
 					Type: aws.String("Environment"),
 				},
 				EnvironmentConfig: EnvironmentConfig{
-					CDNConfig: environmentCDNConfig{
+					CDNConfig: EnvironmentCDNConfig{
 						Enabled: aws.Bool(true),
 					},
 				},
@@ -448,11 +494,147 @@ http:
 							Certificates: []string{"cert-1", "cert-2"},
 						},
 						Private: privateHTTPConfig{
-							SecurityGroupsConfig: securityGroupsConfig{
-								Ingress: Ingress{
+							DeprecatedSG: DeprecatedALBSecurityGroupsConfig{
+								DeprecatedIngress: DeprecatedIngress{
 									VPCIngress: aws.Bool(false),
 								},
 							},
+						},
+					},
+				},
+			},
+		},
+		"unmarshal with new http fields": {
+			inContent: `name: prod
+type: Environment
+http:
+    public:
+        certificates:
+            - cert-1
+            - cert-2
+    private:
+      ingress:
+        vpc: true
+`,
+			wantedStruct: &Environment{
+				Workload: Workload{
+					Name: aws.String("prod"),
+					Type: aws.String("Environment"),
+				},
+				EnvironmentConfig: EnvironmentConfig{
+					HTTPConfig: EnvironmentHTTPConfig{
+						Public: PublicHTTPConfig{
+							Certificates: []string{"cert-1", "cert-2"},
+						},
+						Private: privateHTTPConfig{
+							Ingress: RelaxedIngress{VPCIngress: aws.Bool(true)},
+						},
+					},
+				},
+			},
+		},
+		"unmarshal with new and old private http fields": {
+			inContent: `name: prod
+type: Environment
+http:
+    public:
+        certificates:
+            - cert-1
+            - cert-2
+    private:
+      security_groups:
+        ingress:
+          from_vpc: true
+      ingress:
+        vpc: true
+`,
+			wantedStruct: &Environment{
+				Workload: Workload{
+					Name: aws.String("prod"),
+					Type: aws.String("Environment"),
+				},
+				EnvironmentConfig: EnvironmentConfig{
+					HTTPConfig: EnvironmentHTTPConfig{
+						Public: PublicHTTPConfig{
+							Certificates: []string{"cert-1", "cert-2"},
+						},
+						Private: privateHTTPConfig{
+							Ingress: RelaxedIngress{VPCIngress: aws.Bool(true)},
+							DeprecatedSG: DeprecatedALBSecurityGroupsConfig{
+								DeprecatedIngress: DeprecatedIngress{
+									VPCIngress: aws.Bool(true),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"unmarshal with new and old public http fields": {
+			inContent: `name: prod
+type: Environment
+http:
+    public:
+      certificates:
+        - cert-1
+        - cert-2
+      security_groups:
+        ingress:
+          restrict_to:
+            cdn: true
+      ingress:
+        cdn: true
+`,
+			wantedStruct: &Environment{
+				Workload: Workload{
+					Name: aws.String("prod"),
+					Type: aws.String("Environment"),
+				},
+				EnvironmentConfig: EnvironmentConfig{
+					HTTPConfig: EnvironmentHTTPConfig{
+						Public: PublicHTTPConfig{
+							Certificates: []string{"cert-1", "cert-2"},
+							DeprecatedSG: DeprecatedALBSecurityGroupsConfig{
+								DeprecatedIngress: DeprecatedIngress{
+									RestrictiveIngress: RestrictiveIngress{
+										CDNIngress: aws.Bool(true),
+									},
+								},
+							},
+							Ingress: RestrictiveIngress{CDNIngress: aws.Bool(true)},
+						},
+					},
+				},
+			},
+		},
+		"unmarshal with source_ips field in http.public": {
+			inContent: `name: prod
+type: Environment
+http:
+    public:
+      certificates:
+        - cert-1
+        - cert-2
+      security_groups:
+        ingress:
+          restrict_to:
+            cdn: true
+      ingress:
+        source_ips:
+          - 1.1.1.1
+          - 2.2.2.2
+`,
+			wantedStruct: &Environment{
+				Workload: Workload{
+					Name: aws.String("prod"),
+					Type: aws.String("Environment"),
+				},
+				EnvironmentConfig: EnvironmentConfig{
+					HTTPConfig: EnvironmentHTTPConfig{
+						Public: PublicHTTPConfig{
+							Certificates: []string{"cert-1", "cert-2"},
+							DeprecatedSG: DeprecatedALBSecurityGroupsConfig{DeprecatedIngress: DeprecatedIngress{RestrictiveIngress: RestrictiveIngress{CDNIngress: aws.Bool(true)}}},
+							Ingress:      RestrictiveIngress{SourceIPs: []IPNet{"1.1.1.1", "2.2.2.2"}},
 						},
 					},
 				},
@@ -669,10 +851,28 @@ func TestEnvironmentVPCConfig_IsEmpty(t *testing.T) {
 		"empty": {
 			wanted: true,
 		},
-		"not empty": {
+		"not empty when VPC ID is provided": {
 			in: environmentVPCConfig{
 				ID: aws.String("mock-vpc-id"),
 			},
+		},
+		"not empty when flowlog is on": {
+			in: environmentVPCConfig{
+				FlowLogs: Union[*bool, VPCFlowLogsArgs]{
+					Basic: aws.Bool(true),
+				},
+			},
+			wanted: true,
+		},
+		"not empty when flowlog with specific retention": {
+			in: environmentVPCConfig{
+				FlowLogs: Union[*bool, VPCFlowLogsArgs]{
+					Advanced: VPCFlowLogsArgs{
+						Retention: aws.Int(60),
+					},
+				},
+			},
+			wanted: true,
 		},
 	}
 	for name, tc := range testCases {
@@ -699,6 +899,29 @@ func TestSubnetsConfiguration_IsEmpty(t *testing.T) {
 					},
 				},
 			},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			got := tc.in.IsEmpty()
+			require.Equal(t, tc.wanted, got)
+		})
+	}
+}
+
+func TestCDNStaticConfig_IsEmpty(t *testing.T) {
+	testCases := map[string]struct {
+		in     CDNStaticConfig
+		wanted bool
+	}{
+		"empty": {
+			wanted: true,
+		},
+		"not empty": {
+			in: CDNStaticConfig{
+				Path: "something",
+			},
+			wanted: false,
 		},
 	}
 	for name, tc := range testCases {
@@ -741,9 +964,14 @@ func TestPublicHTTPConfig_IsEmpty(t *testing.T) {
 		"empty": {
 			wanted: true,
 		},
-		"not empty": {
+		"not empty when Certificates are attached": {
 			in: PublicHTTPConfig{
 				Certificates: []string{"mock-cert-1"},
+			},
+		},
+		"not empty when SSL Policy is present": {
+			in: PublicHTTPConfig{
+				SSLPolicy: aws.String("mock-ELB-ELBSecurityPolicy"),
 			},
 		},
 	}
@@ -763,9 +991,14 @@ func TestPrivateHTTPConfig_IsEmpty(t *testing.T) {
 		"empty": {
 			wanted: true,
 		},
-		"not empty": {
+		"not empty when Certificates are attached": {
 			in: privateHTTPConfig{
 				InternalALBSubnets: []string{"mock-subnet-1"},
+			},
+		},
+		"not empty when SSL Policy is present": {
+			in: privateHTTPConfig{
+				SSLPolicy: aws.String("mock-ELB-ELBSecurityPolicy"),
 			},
 		},
 	}
@@ -804,16 +1037,24 @@ func TestEnvironmentObservability_IsEmpty(t *testing.T) {
 
 func TestEnvironmentCDNConfig_IsEmpty(t *testing.T) {
 	testCases := map[string]struct {
-		in     environmentCDNConfig
+		in     EnvironmentCDNConfig
 		wanted bool
 	}{
 		"empty": {
-			in:     environmentCDNConfig{},
+			in:     EnvironmentCDNConfig{},
 			wanted: true,
 		},
 		"not empty": {
-			in: environmentCDNConfig{
+			in: EnvironmentCDNConfig{
 				Enabled: aws.Bool(false),
+			},
+			wanted: false,
+		},
+		"advanced not empty": {
+			in: EnvironmentCDNConfig{
+				Config: AdvancedCDNConfig{
+					Certificate: aws.String("arn:aws:acm:us-east-1:1111111:certificate/look-like-a-good-arn"),
+				},
 			},
 			wanted: false,
 		},
@@ -827,24 +1068,38 @@ func TestEnvironmentCDNConfig_IsEmpty(t *testing.T) {
 	}
 }
 
-func TestEnvironmentCDNConfig_CDNEnabled(t *testing.T) {
+func TestEnvironmentConfig_CDNEnabled(t *testing.T) {
 	testCases := map[string]struct {
-		in     environmentCDNConfig
+		in     EnvironmentConfig
 		wanted bool
 	}{
 		"enabled via bool": {
-			in: environmentCDNConfig{
-				Enabled: aws.Bool(true),
+			in: EnvironmentConfig{
+				CDNConfig: EnvironmentCDNConfig{
+					Enabled: aws.Bool(true),
+				},
+			},
+			wanted: true,
+		},
+		"enabled via config": {
+			in: EnvironmentConfig{
+				CDNConfig: EnvironmentCDNConfig{
+					Config: AdvancedCDNConfig{
+						Certificate: aws.String("arn:aws:acm:us-east-1:1111111:certificate/look-like-a-good-arn"),
+					},
+				},
 			},
 			wanted: true,
 		},
 		"not enabled because empty": {
-			in:     environmentCDNConfig{},
+			in:     EnvironmentConfig{},
 			wanted: false,
 		},
 		"not enabled via bool": {
-			in: environmentCDNConfig{
-				Enabled: aws.Bool(false),
+			in: EnvironmentConfig{
+				CDNConfig: EnvironmentCDNConfig{
+					Enabled: aws.Bool(false),
+				},
 			},
 			wanted: false,
 		},
@@ -854,6 +1109,68 @@ func TestEnvironmentCDNConfig_CDNEnabled(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			got := tc.in.CDNEnabled()
 			require.Equal(t, tc.wanted, got)
+		})
+	}
+}
+
+func TestEnvironmentConfig_ELBAccessLogs(t *testing.T) {
+	testCases := map[string]struct {
+		in            EnvironmentConfig
+		wantedFlag    bool
+		wantedConfigs *ELBAccessLogsArgs
+	}{
+		"enabled via bool": {
+			in: EnvironmentConfig{
+				HTTPConfig: EnvironmentHTTPConfig{
+					Public: PublicHTTPConfig{
+						ELBAccessLogs: ELBAccessLogsArgsOrBool{
+							Enabled: aws.Bool(true),
+						},
+					},
+				},
+			},
+			wantedFlag:    true,
+			wantedConfigs: nil,
+		},
+		"disabled via bool": {
+			in: EnvironmentConfig{
+				HTTPConfig: EnvironmentHTTPConfig{
+					Public: PublicHTTPConfig{
+						ELBAccessLogs: ELBAccessLogsArgsOrBool{
+							Enabled: aws.Bool(false),
+						},
+					},
+				},
+			},
+			wantedFlag:    false,
+			wantedConfigs: nil,
+		},
+		"advanced access logs config": {
+			in: EnvironmentConfig{
+				HTTPConfig: EnvironmentHTTPConfig{
+					Public: PublicHTTPConfig{
+						ELBAccessLogs: ELBAccessLogsArgsOrBool{
+							AdvancedConfig: ELBAccessLogsArgs{
+								Prefix:     aws.String("prefix"),
+								BucketName: aws.String("bucketname"),
+							},
+						},
+					},
+				},
+			},
+			wantedFlag: true,
+			wantedConfigs: &ELBAccessLogsArgs{
+				BucketName: aws.String("bucketname"),
+				Prefix:     aws.String("prefix"),
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			elbAccessLogs, flag := tc.in.ELBAccessLogs()
+			require.Equal(t, tc.wantedFlag, flag)
+			require.Equal(t, tc.wantedConfigs, elbAccessLogs)
 		})
 	}
 }

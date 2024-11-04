@@ -12,6 +12,7 @@ task run に関連する一般的な手順は次の通りです。
 2. コンテナイメージのビルドと ECR へのプッシュ
 3. タスク定義の作成、または更新
 4. タスクを実行し、開始されるのを待つ
+5. タスクが 0 以外の終了コードで終了した場合、その終了コードを転送する
 
 !!!info
     1. 同じグループ名のタスクは同じリソースセットを共有します。リソースセットには例えば CloudFormation スタック、ECR リポジトリ、CloudWatch ロググループ、タスク定義などが含まれます。
@@ -54,6 +55,7 @@ Task Configuration Flags
       --count int                      Optional. The number of tasks to set up. (default 1)
       --cpu int                        Optional. The number of CPU units to reserve for each task. (default 256)
       --entrypoint string              Optional. The entrypoint that is passed to "docker run" to override the default entrypoint.
+      --env-file string                Optional. A path to an environment variable (.env) file with each line being of the form of VARIABLE=VALUE. Values specified with --env-vars take precedence over --env-file.
       --env-vars stringToString        Optional. Environment variables specified by key=value separated by commas. (default [])
       --execution-role string          Optional. The ARN of the role that grants the container agent permission to make AWS API calls.
       --memory int                     Optional. The amount of memory to reserve in MiB for each task. (default 512)
@@ -61,7 +63,9 @@ Task Configuration Flags
       --platform-os string             Optional. Operating system of the task. Must be specified along with 'platform-arch'.
       --resource-tags stringToString   Optional. Labels with a key and value separated by commas.
                                        Allows you to categorize resources. (default [])
-      --secrets stringToString         Optional. Secrets to inject into the container. Specified by key=value separated by commas. (default [])
+      --secrets stringToString         Optional. Secrets to inject into the container. Specified by key=value separated by commas. (default []).
+                                       For secrets stored in AWS Parameter Store you can either specify names or ARNs.
+                                       For the secrets stored in AWS Secrets Manager you need to specify ARNs.
       --task-role string               Optional. The ARN of the role for the task to use.
 
 Utility Flags
@@ -106,7 +110,17 @@ $ copilot task run --subnets subnet-123,subnet-456 --security-groups sg-123,sg-4
 $ copilot task run --command "python migrate-script.py"
 ```
 
-Windows タスクを最小のCPUとメモリで実行します。 
+Windows 2019 タスクを最小の CPU とメモリで実行します。 
 ```console
 $ copilot task run --platform-os WINDOWS_SERVER_2019_CORE --platform-arch X86_64 --cpu 1024 --memory 2048
+```
+
+Windows 2022 タスクを最小の CPU とメモリで実行します。 
+```console
+$ copilot task run --platform-os WINDOWS_SERVER_2022_CORE --platform-arch X86_64 --cpu 1024 --memory 2048
+```
+
+AWS Secrets Manager のシークレットをコンテナに注入してタスクを実行します。
+```console
+$ copilot task run --secrets AuroraSecret=arn:aws:secretsmanager:us-east-1:535307839111:secret:AuroraSecret
 ```

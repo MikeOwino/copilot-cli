@@ -34,6 +34,10 @@ const (
 	customDomainFnName        = "CustomDomainFunction"
 	certValidationFnName      = "CertificateValidationFunction"
 	dnsDelegationFnName       = "DNSDelegationFunction"
+	bucketCleanerFnName       = "BucketCleanerFunction"
+	certReplicatorFnName      = "CertificateReplicatorFunction"
+	uniqueJsonValuesFnName    = "UniqueJSONValuesFunction"
+	triggerStateMachineFnName = "TriggerStateMachineFunction"
 )
 
 // Function source file locations.
@@ -44,10 +48,14 @@ var (
 	customDomainAppRunnerFilePath    = path.Join(customResourcesDir, "custom-domain-app-runner.js")
 	desiredCountDelegationFilePath   = path.Join(customResourcesDir, "desired-count-delegation.js")
 	dnsCertValidationFilePath        = path.Join(customResourcesDir, "dns-cert-validator.js")
+	certReplicatorFilePath           = path.Join(customResourcesDir, "cert-replicator.js")
+	bucketCleanerFilePath            = path.Join(customResourcesDir, "bucket-cleaner.js")
 	dnsDelegationFilePath            = path.Join(customResourcesDir, "dns-delegation.js")
 	envControllerFilePath            = path.Join(customResourcesDir, "env-controller.js")
-	nlbCertValidatorFilePath         = path.Join(customResourcesDir, "nlb-cert-validator.js")
-	nlbCustomDomainFilePath          = path.Join(customResourcesDir, "nlb-custom-domain.js")
+	wkldCertValidatorFilePath        = path.Join(customResourcesDir, "wkld-cert-validator.js")
+	wkldCustomDomainFilePath         = path.Join(customResourcesDir, "wkld-custom-domain.js")
+	uniqueJSONValuesFilePath         = path.Join(customResourcesDir, "unique-json-values.js")
+	triggerStateMachineFilePath      = path.Join(customResourcesDir, "trigger-state-machine.js")
 )
 
 // CustomResource represents a CloudFormation custom resource backed by a Lambda function.
@@ -59,14 +67,14 @@ type CustomResource struct {
 	zip *bytes.Buffer
 }
 
-// FunctionName is the name of the Lambda function.
-func (cr *CustomResource) FunctionName() string {
+// Name returns the name of the custom resource.
+func (cr *CustomResource) Name() string {
 	return cr.name
 }
 
-// ArtifactPath returns the S3 key for the zipped custom resource object.
+// ArtifactPath returns the S3 object key where the custom resource should be stored.
 func (cr *CustomResource) ArtifactPath() string {
-	return artifactpath.CustomResource(strings.ToLower(cr.FunctionName()), cr.zip.Bytes())
+	return artifactpath.CustomResource(strings.ToLower(cr.Name()), cr.zip.Bytes())
 }
 
 // zipReader returns a reader for the zip archive from all the files in the custom resource.
@@ -80,15 +88,15 @@ func (cr *CustomResource) init() error {
 	for _, file := range cr.files {
 		f, err := w.Create(file.name)
 		if err != nil {
-			return fmt.Errorf("create zip file %q for custom resource %q: %v", file.name, cr.FunctionName(), err)
+			return fmt.Errorf("create zip file %q for custom resource %q: %v", file.name, cr.Name(), err)
 		}
 		_, err = f.Write(file.content)
 		if err != nil {
-			return fmt.Errorf("write zip file %q for custom resource %q: %v", file.name, cr.FunctionName(), err)
+			return fmt.Errorf("write zip file %q for custom resource %q: %v", file.name, cr.Name(), err)
 		}
 	}
 	if err := w.Close(); err != nil {
-		return fmt.Errorf("close zip file for custom resource %q: %v", cr.FunctionName(), err)
+		return fmt.Errorf("close zip file for custom resource %q: %v", cr.Name(), err)
 	}
 	cr.zip = buf
 	return nil
@@ -113,8 +121,8 @@ func LBWS(fs template.Reader) ([]*CustomResource, error) {
 		dynamicDesiredCountFnName: desiredCountDelegationFilePath,
 		envControllerFnName:       envControllerFilePath,
 		rulePriorityFnName:        albRulePriorityGeneratorFilePath,
-		nlbCustomDomainFnName:     nlbCustomDomainFilePath,
-		nlbCertValidatorFnName:    nlbCertValidatorFilePath,
+		nlbCustomDomainFnName:     wkldCustomDomainFilePath,
+		nlbCertValidatorFnName:    wkldCertValidatorFilePath,
 	})
 }
 
@@ -136,6 +144,15 @@ func Backend(fs template.Reader) ([]*CustomResource, error) {
 	})
 }
 
+// StaticSite returns the custom resources for a static site service.
+func StaticSite(fs template.Reader) ([]*CustomResource, error) {
+	return buildCustomResources(fs, map[string]string{
+		triggerStateMachineFnName: triggerStateMachineFilePath,
+		certValidationFnName:      wkldCertValidatorFilePath,
+		customDomainFnName:        wkldCustomDomainFilePath,
+	})
+}
+
 // ScheduledJob returns the custom resources for a scheduled job.
 func ScheduledJob(fs template.Reader) ([]*CustomResource, error) {
 	return buildCustomResources(fs, map[string]string{
@@ -146,9 +163,12 @@ func ScheduledJob(fs template.Reader) ([]*CustomResource, error) {
 // Env returns the custom resources for an environment.
 func Env(fs template.Reader) ([]*CustomResource, error) {
 	return buildCustomResources(fs, map[string]string{
-		certValidationFnName: dnsCertValidationFilePath,
-		customDomainFnName:   customDomainFilePath,
-		dnsDelegationFnName:  dnsDelegationFilePath,
+		certValidationFnName:   dnsCertValidationFilePath,
+		customDomainFnName:     customDomainFilePath,
+		dnsDelegationFnName:    dnsDelegationFilePath,
+		certReplicatorFnName:   certReplicatorFilePath,
+		bucketCleanerFnName:    bucketCleanerFilePath,
+		uniqueJsonValuesFnName: uniqueJSONValuesFilePath,
 	})
 }
 
@@ -162,9 +182,9 @@ func Upload(upload UploadFunc, crs []*CustomResource) (map[string]string, error)
 	for _, cr := range crs {
 		url, err := upload(cr.ArtifactPath(), cr.zipReader())
 		if err != nil {
-			return nil, fmt.Errorf("upload custom resource %q: %w", cr.FunctionName(), err)
+			return nil, fmt.Errorf("upload custom resource %q: %w", cr.Name(), err)
 		}
-		urls[cr.FunctionName()] = url
+		urls[cr.Name()] = url
 	}
 	return urls, nil
 }

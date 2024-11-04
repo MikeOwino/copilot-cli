@@ -10,6 +10,8 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/copilot-cli/internal/pkg/template"
+	"github.com/aws/copilot-cli/internal/pkg/version"
+	"gopkg.in/yaml.v3"
 
 	"github.com/aws/aws-sdk-go/aws"
 	awscfn "github.com/aws/aws-sdk-go/service/cloudformation"
@@ -21,8 +23,8 @@ import (
 )
 
 // CreateAndRenderEnvironment creates the CloudFormation stack for an environment, and render the stack creation to out.
-func (cf CloudFormation) CreateAndRenderEnvironment(env *deploy.CreateEnvironmentInput) error {
-	cfnStack, err := cf.toUploadedStack(env.ArtifactBucketARN, stack.NewBootstrapEnvStackConfig(env))
+func (cf CloudFormation) CreateAndRenderEnvironment(conf StackConfiguration, bucketARN string) error {
+	cfnStack, err := cf.toUploadedStack(bucketARN, conf)
 	if err != nil {
 		return err
 	}
@@ -38,11 +40,11 @@ func (cf CloudFormation) CreateAndRenderEnvironment(env *deploy.CreateEnvironmen
 		}
 		return changeSetID, nil
 	}
-	return cf.renderStackChanges(in)
+	return cf.executeAndRenderChangeSet(in)
 }
 
 // UpdateAndRenderEnvironment updates the CloudFormation stack for an environment, and render the stack creation to out.
-func (cf CloudFormation) UpdateAndRenderEnvironment(conf StackConfiguration, bucketARN string, opts ...cloudformation.StackOption) error {
+func (cf CloudFormation) UpdateAndRenderEnvironment(conf StackConfiguration, bucketARN string, detach bool, opts ...cloudformation.StackOption) error {
 	cfnStack, err := cf.toUploadedStack(bucketARN, conf)
 	if err != nil {
 		return err
@@ -62,11 +64,13 @@ func (cf CloudFormation) UpdateAndRenderEnvironment(conf StackConfiguration, buc
 		}
 		return changeSetID, nil
 	}
-	return cf.renderStackChanges(in)
+	in.enableInterrupt = true
+	in.detach = detach
+	return cf.executeAndRenderChangeSet(in)
 }
 
-func newRenderEnvironmentInput(cfnStack *cloudformation.Stack) *renderStackChangesInput {
-	return &renderStackChangesInput{
+func newRenderEnvironmentInput(cfnStack *cloudformation.Stack) *executeAndRenderChangeSetInput {
+	return &executeAndRenderChangeSetInput{
 		stackName:        cfnStack.Name,
 		stackDescription: fmt.Sprintf("Creating the infrastructure for the %s environment.", cfnStack.Name),
 	}
@@ -74,18 +78,20 @@ func newRenderEnvironmentInput(cfnStack *cloudformation.Stack) *renderStackChang
 
 // DeleteEnvironment deletes the CloudFormation stack of an environment.
 func (cf CloudFormation) DeleteEnvironment(appName, envName, cfnExecRoleARN string) error {
-	conf := stack.NewEnvStackConfig(&deploy.CreateEnvironmentInput{
-		App: deploy.AppInformation{
-			Name: appName,
+	stackName := stack.NameForEnv(appName, envName)
+	description := fmt.Sprintf("Delete environment stack %s", stackName)
+	return cf.deleteAndRenderStack(deleteAndRenderInput{
+		stackName:   stackName,
+		description: description,
+		deleteFn: func() error {
+			return cf.cfnClient.DeleteAndWaitWithRoleARN(stackName, cfnExecRoleARN)
 		},
-		Name: envName,
 	})
-	return cf.cfnClient.DeleteAndWaitWithRoleARN(conf.StackName(), cfnExecRoleARN)
 }
 
 // GetEnvironment returns the Environment metadata from the CloudFormation stack.
 func (cf CloudFormation) GetEnvironment(appName, envName string) (*config.Environment, error) {
-	conf := stack.NewBootstrapEnvStackConfig(&deploy.CreateEnvironmentInput{
+	conf := stack.NewBootstrapEnvStackConfig(&stack.EnvConfig{
 		App: deploy.AppInformation{
 			Name: appName,
 		},
@@ -95,13 +101,7 @@ func (cf CloudFormation) GetEnvironment(appName, envName string) (*config.Enviro
 	if err != nil {
 		return nil, err
 	}
-	return conf.ToEnv(descr.SDK())
-}
-
-// EnvironmentTemplate returns the environment stack's template.
-func (cf CloudFormation) EnvironmentTemplate(appName, envName string) (string, error) {
-	stackName := stack.NameForEnv(appName, envName)
-	return cf.cfnClient.TemplateBody(stackName)
+	return conf.ToEnvMetadata(descr.SDK())
 }
 
 // ForceUpdateOutputID returns the environment stack's last force update ID.
@@ -118,8 +118,15 @@ func (cf CloudFormation) ForceUpdateOutputID(app, env string) (string, error) {
 	return "", nil
 }
 
-// EnvironmentParameters returns the environment stack's parameters.
-func (cf CloudFormation) EnvironmentParameters(appName, envName string) ([]*awscfn.Parameter, error) {
+// DeployedEnvironmentParameters returns the environment stack's parameters.
+func (cf CloudFormation) DeployedEnvironmentParameters(appName, envName string) ([]*awscfn.Parameter, error) {
+	isInitial, err := cf.isInitialDeployment(appName, envName)
+	if err != nil {
+		return nil, err
+	}
+	if isInitial {
+		return nil, nil
+	}
 	out, err := cf.cachedStack(stack.NameForEnv(appName, envName))
 	if err != nil {
 		return nil, err
@@ -189,4 +196,19 @@ func (cf CloudFormation) cachedStack(stackName string) (*cloudformation.StackDes
 	}
 	cf.cachedDeployedStack = stackDescr
 	return cf.cachedDeployedStack, nil
+}
+
+// isInitialDeployment returns whether this is the first deployment of the environment stack.
+func (cf CloudFormation) isInitialDeployment(appName, envName string) (bool, error) {
+	raw, err := cf.cfnClient.Metadata(cloudformation.MetadataWithStackName(stack.NameForEnv(appName, envName)))
+	if err != nil {
+		return false, fmt.Errorf("get metadata of stack %q: %w", stack.NameForEnv(appName, envName), err)
+	}
+	metadata := struct {
+		Version string `yaml:"Version"`
+	}{}
+	if err := yaml.Unmarshal([]byte(raw), &metadata); err != nil {
+		return false, fmt.Errorf("unmarshal Metadata property to read Version: %w", err)
+	}
+	return metadata.Version == version.EnvTemplateBootstrap, nil
 }

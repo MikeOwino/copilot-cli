@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -18,10 +19,10 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/describe"
 	"github.com/aws/copilot-cli/internal/pkg/exec"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/version"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 
-	"github.com/aws/copilot-cli/internal/pkg/addon"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/config"
@@ -36,12 +37,14 @@ const (
 )
 
 type packageSvcVars struct {
-	name         string
-	envName      string
-	appName      string
-	tag          string
-	outputDir    string
-	uploadAssets bool
+	name               string
+	envName            string
+	appName            string
+	tag                string
+	outputDir          string
+	uploadAssets       bool
+	showDiff           bool
+	allowWkldDowngrade bool
 
 	// To facilitate unit tests.
 	clientConfigured bool
@@ -57,26 +60,34 @@ type packageSvcOpts struct {
 	templateWriter       io.WriteCloser
 	paramsWriter         io.WriteCloser
 	addonsWriter         io.WriteCloser
+	diffWriter           io.Writer
 	runner               execRunner
+	svcVersionGetter     versionGetter
 	sessProvider         *sessions.Provider
 	sel                  wsSelector
 	unmarshal            func([]byte) (manifest.DynamicWorkload, error)
 	newInterpolator      func(app, env string) interpolator
 	newStackGenerator    func(*packageSvcOpts) (workloadStackGenerator, error)
 	envFeaturesDescriber versionCompatibilityChecker
+	gitShortCommit       string
 
 	// cached variables
-	targetApp       *config.Application
-	targetEnv       *config.Environment
-	envSess         *session.Session
-	appliedManifest manifest.DynamicWorkload
-	rootUserARN     string
+	targetApp         *config.Application
+	targetEnv         *config.Environment
+	envSess           *session.Session
+	rawMft            string
+	appliedDynamicMft manifest.DynamicWorkload
+	rootUserARN       string
+
+	// Overridden in tests.
+	templateVersion string
 }
 
 func newPackageSvcOpts(vars packageSvcVars) (*packageSvcOpts, error) {
-	ws, err := workspace.New()
+	fs := afero.NewOsFs()
+	ws, err := workspace.Use(fs)
 	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
+		return nil, err
 	}
 
 	sessProvider := sessions.ImmutableProvider(sessions.UserAgentExtras("svc package"))
@@ -91,13 +102,15 @@ func newPackageSvcOpts(vars packageSvcVars) (*packageSvcOpts, error) {
 		packageSvcVars:    vars,
 		store:             store,
 		ws:                ws,
-		fs:                &afero.Afero{Fs: afero.NewOsFs()},
+		fs:                fs,
 		unmarshal:         manifest.UnmarshalWorkload,
 		runner:            exec.NewCmd(),
-		sel:               selector.NewLocalWorkloadSelector(prompter, store, ws),
+		sel:               selector.NewLocalWorkloadSelector(prompter, store, ws, selector.OnlyInitializedWorkloads),
 		templateWriter:    os.Stdout,
 		paramsWriter:      discardFile{},
 		addonsWriter:      discardFile{},
+		diffWriter:        os.Stdout,
+		templateVersion:   version.LatestTemplateVersion(),
 		newInterpolator:   newManifestInterpolator,
 		sessProvider:      sessProvider,
 		newStackGenerator: newWorkloadStackGenerator,
@@ -114,22 +127,26 @@ func newWorkloadStackGenerator(o *packageSvcOpts) (workloadStackGenerator, error
 	if err != nil {
 		return nil, err
 	}
-	raw, err := o.ws.ReadWorkloadManifest(o.name)
+	ovrdr, err := clideploy.NewOverrider(o.ws.WorkloadOverridesPath(o.name), o.appName, o.envName, o.fs, o.sessProvider)
 	if err != nil {
-		return nil, fmt.Errorf("read manifest file for %s: %w", o.name, err)
+		return nil, err
 	}
 
-	content := o.appliedManifest.Manifest()
+	content := o.appliedDynamicMft.Manifest()
 	var deployer workloadStackGenerator
 	in := clideploy.WorkloadDeployerInput{
-		SessionProvider:   o.sessProvider,
-		Name:              o.name,
-		App:               targetApp,
-		Env:               targetEnv,
-		ImageTag:          o.tag,
-		Mft:               content,
-		RawMft:            raw,
-		UploadAddonAssets: o.uploadAssets && false, // TODO(dnrnd): remove to enable packaging addons
+		SessionProvider: o.sessProvider,
+		Name:            o.name,
+		App:             targetApp,
+		Env:             targetEnv,
+		Image: clideploy.ContainerImageIdentifier{
+			CustomTag:         o.tag,
+			GitShortCommitTag: o.gitShortCommit,
+		},
+		Mft:              content,
+		RawMft:           o.rawMft,
+		EnvVersionGetter: o.envFeaturesDescriber,
+		Overrider:        ovrdr,
 	}
 	switch t := content.(type) {
 	case *manifest.LoadBalancedWebService:
@@ -142,6 +159,8 @@ func newWorkloadStackGenerator(o *packageSvcOpts) (workloadStackGenerator, error
 		deployer, err = clideploy.NewWorkerSvcDeployer(&in)
 	case *manifest.ScheduledJob:
 		deployer, err = clideploy.NewJobDeployer(&in)
+	case *manifest.StaticSite:
+		deployer, err = clideploy.NewStaticSiteDeployer(&in)
 	default:
 		return nil, fmt.Errorf("unknown manifest type %T while creating the CloudFormation stack", t)
 	}
@@ -182,6 +201,11 @@ func (o *packageSvcOpts) Execute() error {
 			return err
 		}
 	}
+	if !o.allowWkldDowngrade {
+		if err := validateWkldVersion(o.svcVersionGetter, o.name, o.templateVersion); err != nil {
+			return err
+		}
+	}
 	if o.outputDir != "" {
 		if err := o.setOutputFileWriters(); err != nil {
 			return err
@@ -199,6 +223,18 @@ func (o *packageSvcOpts) Execute() error {
 	if err != nil {
 		return err
 	}
+	if o.showDiff {
+		if err := diff(gen, stack.template, o.diffWriter); err != nil {
+			var errHasDiff *errHasDiff
+			if errors.As(err, &errHasDiff) {
+				return err
+			}
+			return &errDiffNotAvailable{
+				parentErr: err,
+			}
+		}
+		return nil
+	}
 	if err := o.writeAndClose(o.templateWriter, stack.template); err != nil {
 		return err
 	}
@@ -206,14 +242,11 @@ func (o *packageSvcOpts) Execute() error {
 		return err
 	}
 	addonsTemplate, err := gen.AddonsTemplate()
-	if err != nil {
-		// return nil if addons not found.
-		var notFoundErr *addon.ErrAddonsNotFound
-		if errors.As(err, &notFoundErr) {
-			return nil
-		}
-
+	switch {
+	case err != nil:
 		return fmt.Errorf("retrieve addons template: %w", err)
+	case addonsTemplate == "":
+		return nil
 	}
 	// Addons template won't show up without setting --output-dir flag.
 	if o.outputDir != "" {
@@ -230,7 +263,7 @@ func (o *packageSvcOpts) validateOrAskSvcName() error {
 		if err != nil {
 			return fmt.Errorf("list services in the workspace: %w", err)
 		}
-		if !contains(o.name, names) {
+		if !slices.Contains(names, o.name) {
 			return fmt.Errorf("service '%s' does not exist in the workspace", o.name)
 		}
 		return nil
@@ -259,7 +292,7 @@ func (o *packageSvcOpts) validateOrAskEnvName() error {
 }
 
 func (o *packageSvcOpts) configureClients() error {
-	o.tag = imageTagFromGit(o.runner, o.tag) // Best effort assign git tag.
+	o.gitShortCommit = imageTagFromGit(o.runner) // Best effort assign git tag.
 	// client to retrieve an application's resources created with CloudFormation.
 	defaultSess, err := o.sessProvider.Default()
 	if err != nil {
@@ -290,6 +323,17 @@ func (o *packageSvcOpts) configureClients() error {
 		return err
 	}
 	o.envFeaturesDescriber = envDescriber
+
+	wkldDescriber, err := describe.NewWorkloadStackDescriber(describe.NewWorkloadConfig{
+		App:         o.appName,
+		Env:         o.envName,
+		Name:        o.name,
+		ConfigStore: o.store,
+	})
+	if err != nil {
+		return err
+	}
+	o.svcVersionGetter = wkldDescriber
 	return nil
 }
 
@@ -299,19 +343,23 @@ type cfnStackConfig struct {
 }
 
 func (o *packageSvcOpts) getStackGenerator(env *config.Environment) (workloadStackGenerator, error) {
-	mft, err := workloadManifest(&workloadManifestInput{
+	mft, interpolated, err := workloadManifest(&workloadManifestInput{
 		name:         o.name,
 		appName:      o.appName,
 		envName:      o.envName,
-		interpolator: o.newInterpolator(o.appName, o.envName),
 		ws:           o.ws,
+		interpolator: o.newInterpolator(o.appName, o.envName),
 		unmarshal:    o.unmarshal,
 		sess:         o.envSess,
 	})
 	if err != nil {
 		return nil, err
 	}
-	o.appliedManifest = mft
+	o.appliedDynamicMft = mft
+	o.rawMft = interpolated
+	if err := validateWorkloadManifestCompatibilityWithEnv(o.ws, o.envFeaturesDescriber, o.appliedDynamicMft, o.envName); err != nil {
+		return nil, err
+	}
 	return o.newStackGenerator(o)
 }
 
@@ -321,9 +369,7 @@ func (o *packageSvcOpts) getWorkloadStack(generator workloadStackGenerator) (*cf
 	if err != nil {
 		return nil, err
 	}
-	uploadOut := clideploy.UploadArtifactsOutput{
-		ImageDigest: aws.String(""),
-	}
+	var uploadOut clideploy.UploadArtifactsOutput
 	if o.uploadAssets {
 		out, err := generator.UploadArtifacts()
 		if err != nil {
@@ -333,12 +379,14 @@ func (o *packageSvcOpts) getWorkloadStack(generator workloadStackGenerator) (*cf
 	}
 	output, err := generator.GenerateCloudFormationTemplate(&clideploy.GenerateCloudFormationTemplateInput{
 		StackRuntimeConfiguration: clideploy.StackRuntimeConfiguration{
-			RootUserARN:        o.rootUserARN,
-			Tags:               targetApp.Tags,
-			ImageDigest:        uploadOut.ImageDigest,
-			EnvFileARN:         uploadOut.EnvFileARN,
-			AddonsURL:          uploadOut.AddonsURL,
-			CustomResourceURLs: uploadOut.CustomResourceURLs,
+			RootUserARN:               o.rootUserARN,
+			Tags:                      targetApp.Tags,
+			EnvFileARNs:               uploadOut.EnvFileARNs,
+			ImageDigests:              uploadOut.ImageDigests,
+			AddonsURL:                 uploadOut.AddonsURL,
+			Version:                   o.templateVersion,
+			CustomResourceURLs:        uploadOut.CustomResourceURLs,
+			StaticSiteAssetMappingURL: uploadOut.StaticSiteAssetMappingLocation,
 		},
 	})
 	if err != nil {
@@ -417,18 +465,27 @@ func (o *packageSvcOpts) writeAndClose(wc io.WriteCloser, dat string) error {
 	return wc.Close()
 }
 
-// RecommendActions suggests recommended actions before the packaged template is used for deployment.
+// RecommendActions is a no-op.
 func (o *packageSvcOpts) RecommendActions() error {
-	return validateWorkloadManifestCompatibilityWithEnv(o.ws, o.envFeaturesDescriber, o.appliedManifest, o.envName)
+	return nil
 }
 
-func contains(s string, items []string) bool {
-	for _, item := range items {
-		if s == item {
-			return true
-		}
-	}
-	return false
+type errDiffNotAvailable struct {
+	parentErr error
+}
+
+// Unwrap returns the parent error that is wrapped inside errDiffNotAvailable.
+func (e *errDiffNotAvailable) Unwrap() error {
+	return e.parentErr
+}
+
+func (e *errDiffNotAvailable) Error() string {
+	return e.parentErr.Error()
+}
+
+// ExitCode returns 2 when a diff is unavailable due to a parent error.
+func (e *errDiffNotAvailable) ExitCode() int {
+	return 2
 }
 
 // buildSvcPackageCmd builds the command for printing a service's CloudFormation template.
@@ -462,5 +519,10 @@ func buildSvcPackageCmd() *cobra.Command {
 	cmd.Flags().StringVar(&vars.tag, imageTagFlag, "", imageTagFlagDescription)
 	cmd.Flags().StringVar(&vars.outputDir, stackOutputDirFlag, "", stackOutputDirFlagDescription)
 	cmd.Flags().BoolVar(&vars.uploadAssets, uploadAssetsFlag, false, uploadAssetsFlagDescription)
+	cmd.Flags().BoolVar(&vars.showDiff, diffFlag, false, diffFlagDescription)
+	cmd.Flags().BoolVar(&vars.allowWkldDowngrade, allowDowngradeFlag, false, allowDowngradeFlagDescription)
+
+	cmd.MarkFlagsMutuallyExclusive(diffFlag, stackOutputDirFlag)
+	cmd.MarkFlagsMutuallyExclusive(diffFlag, uploadAssetsFlag)
 	return cmd
 }

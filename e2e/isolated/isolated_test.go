@@ -6,14 +6,15 @@ package isolated_test
 import (
 	"errors"
 	"fmt"
-	"github.com/aws/copilot-cli/e2e/internal/client"
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 	"net/http"
+
+	"github.com/aws/copilot-cli/e2e/internal/client"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Isolated", func() {
-	Context("when creating a new app", func() {
+	Context("when creating a new app", Ordered, func() {
 		var appInitErr error
 		BeforeAll(func() {
 			_, appInitErr = cli.AppInit(&client.AppInitRequest{
@@ -64,47 +65,45 @@ var _ = Describe("Isolated", func() {
 		})
 	})
 
-	Context("when adding environment with imported vpc resources", func() {
+	Context("when adding environment with imported vpc resources", Ordered, func() {
 		var testEnvInitErr error
 		BeforeAll(func() {
 			_, testEnvInitErr = cli.EnvInit(&client.EnvInitRequest{
 				AppName:       appName,
 				EnvName:       envName,
-				Profile:       "default",
-				Prod:          false,
+				Profile:       envName,
 				VPCImport:     vpcImport,
 				CustomizedEnv: true,
 			})
 		})
-		It("env init should succeed for 'private' env", func() {
+		It("env init should succeed for 'test' env", func() {
 			Expect(testEnvInitErr).NotTo(HaveOccurred())
 		})
 	})
 
-	Context("when deploying the environment", func() {
-		var privateEnvDeployErr error
+	Context("when deploying the environment", Ordered, func() {
+		var testEnvDeployErr error
 		BeforeAll(func() {
-			_, privateEnvDeployErr = cli.EnvDeploy(&client.EnvDeployRequest{
+			_, testEnvDeployErr = cli.EnvDeploy(&client.EnvDeployRequest{
 				AppName: appName,
 				Name:    envName,
 			})
 		})
 		It("should succeed", func() {
-			Expect(privateEnvDeployErr).NotTo(HaveOccurred())
+			Expect(testEnvDeployErr).NotTo(HaveOccurred())
 		})
-		It("env ls should list private env", func() {
+		It("env ls should list test env", func() {
 			envListOutput, err := cli.EnvList(appName)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(envListOutput.Envs)).To(Equal(1))
 			env := envListOutput.Envs[0]
 			Expect(env.Name).To(Equal(envName))
-			Expect(env.Prod).To(BeFalse())
 			Expect(env.ExecutionRole).NotTo(BeEmpty())
 			Expect(env.ManagerRole).NotTo(BeEmpty())
 		})
 	})
 
-	Context("when creating a backend service in private subnets", func() {
+	Context("when creating a backend service in private subnets", Ordered, func() {
 		var initErr error
 		BeforeAll(func() {
 			_, initErr = cli.SvcInit(&client.SvcInitRequest{
@@ -126,21 +125,21 @@ var _ = Describe("Isolated", func() {
 		})
 	})
 
-	Context("when deploying a svc to 'private' env", func() {
-		var privateEnvDeployErr error
+	Context("when deploying a svc to 'test' env", Ordered, func() {
+		var testEnvDeployErr error
 		BeforeAll(func() {
-			_, privateEnvDeployErr = cli.SvcDeploy(&client.SvcDeployInput{
+			_, testEnvDeployErr = cli.SvcDeploy(&client.SvcDeployInput{
 				Name:    svcName,
 				EnvName: envName,
 			})
 		})
 
 		It("svc deploy should succeed", func() {
-			Expect(privateEnvDeployErr).NotTo(HaveOccurred())
+			Expect(testEnvDeployErr).NotTo(HaveOccurred())
 		})
 	})
 
-	Context("when running svc show to retrieve the service configuration, resources, and endpoint, then querying the service", func() {
+	Context("when running svc show to retrieve the service configuration, resources, and endpoint, then querying the service", Ordered, func() {
 		var (
 			svc          *client.SvcShowOutput
 			svcShowError error
@@ -215,6 +214,8 @@ var _ = Describe("Isolated", func() {
 		It("session manager should be installed", func() {
 			// Use custom SSM plugin as the public version is not compatible to Alpine Linux.
 			err := client.BashExec("chmod +x ./session-manager-plugin")
+			Expect(err).NotTo(HaveOccurred())
+			err = client.BashExec("mv ./session-manager-plugin /bin/session-manager-plugin")
 			Expect(err).NotTo(HaveOccurred())
 		})
 		It("is reachable", func() {

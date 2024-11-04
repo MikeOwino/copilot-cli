@@ -7,13 +7,15 @@ Parameters:
     Description: The environment name your service, job, or workflow is being deployed to.
   Name:
     Type: String
-    Description: The name of the service, job, or workflow being deployed.
+    Description: Your workload's name.
 Resources:
   e2epipelineaddonBucket:
     Metadata:
       'aws:copilot:description': 'An Amazon S3 bucket to store and retrieve objects for e2e-pipeline-addon'
     Type: AWS::S3::Bucket
     Properties:
+      VersioningConfiguration:
+        Status: Enabled
       AccessControl: Private
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -22,6 +24,17 @@ Resources:
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAllObjects
+            Status: Enabled
+            ExpirationInDays: 1
+            NoncurrentVersionExpirationInDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
 
   e2epipelineaddonBucketPolicy:
     Metadata:

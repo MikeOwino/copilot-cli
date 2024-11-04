@@ -7,18 +7,21 @@ package stack_test
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
 
+	"github.com/spf13/afero"
 	"gopkg.in/yaml.v3"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/copilot-cli/internal/pkg/addon"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/workspace"
 
 	"github.com/stretchr/testify/require"
 )
@@ -40,7 +43,7 @@ func TestGrpcLoadBalancedWebService_Template(t *testing.T) {
 		},
 	}
 	path := filepath.Join("testdata", "workloads", svcGrpcManifestPath)
-	manifestBytes, err := ioutil.ReadFile(path)
+	manifestBytes, err := os.ReadFile(path)
 	require.NoError(t, err)
 	for name, tc := range testCases {
 		interpolated, err := manifest.NewInterpolator(appName, tc.envName).Interpolate(string(manifestBytes))
@@ -51,13 +54,25 @@ func TestGrpcLoadBalancedWebService_Template(t *testing.T) {
 		require.NoError(t, err)
 		err = envMft.Validate()
 		require.NoError(t, err)
+		err = envMft.Load(session.New())
+		require.NoError(t, err)
 		content := envMft.Manifest()
 
 		v, ok := content.(*manifest.LoadBalancedWebService)
 		require.True(t, ok)
 
-		addons, err := addon.New(aws.StringValue(v.Name))
+		// Create in-memory mock file system.
+		wd, err := os.Getwd()
 		require.NoError(t, err)
+		fs := afero.NewMemMapFs()
+		_ = fs.MkdirAll(fmt.Sprintf("%s/copilot", wd), 0755)
+		_ = afero.WriteFile(fs, fmt.Sprintf("%s/copilot/.workspace", wd), []byte(fmt.Sprintf("---\napplication: %s", "DavidsApp")), 0644)
+		require.NoError(t, err)
+
+		ws, err := workspace.Use(fs)
+		_, err = addon.ParseFromWorkload(aws.StringValue(v.Name), ws)
+		var notFound *addon.ErrAddonsNotFound
+		require.ErrorAs(t, err, &notFound)
 
 		envConfig := &manifest.Environment{
 			Workload: manifest.Workload{
@@ -67,17 +82,19 @@ func TestGrpcLoadBalancedWebService_Template(t *testing.T) {
 		envConfig.HTTPConfig.Public.Certificates = []string{"mockCertARN"}
 		svcDiscoveryEndpointName := fmt.Sprintf("%s.%s.local", tc.envName, appName)
 		serializer, err := stack.NewLoadBalancedWebService(stack.LoadBalancedWebServiceConfig{
-			App:         &config.Application{Name: appName},
-			EnvManifest: envConfig,
-			Manifest:    v,
+			App:                &config.Application{Name: appName},
+			EnvManifest:        envConfig,
+			Manifest:           v,
+			ArtifactBucketName: "bucket",
+			ArtifactKey:        "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab",
 			RuntimeConfig: stack.RuntimeConfig{
 				ServiceDiscoveryEndpoint: svcDiscoveryEndpointName,
 				AccountID:                "123456789123",
 				Region:                   "us-west-2",
+				EnvVersion:               "v1.42.0",
+				Version:                  "v1.29.0",
 			},
-			Addons: addons,
 		})
-
 		tpl, err := serializer.Template()
 		require.NoError(t, err, "template should render")
 		regExpGUID := regexp.MustCompile(`([a-f\d]{8}-)([a-f\d]{4}-){3}([a-f\d]{12})`) // Matches random guids
@@ -90,12 +107,14 @@ func TestGrpcLoadBalancedWebService_Template(t *testing.T) {
 			mActual := make(map[interface{}]interface{})
 			require.NoError(t, yaml.Unmarshal(actualBytes, mActual))
 
-			expected, err := ioutil.ReadFile(filepath.Join("testdata", "workloads", tc.svcStackPath))
+			expected, err := os.ReadFile(filepath.Join("testdata", "workloads", tc.svcStackPath))
 			require.NoError(t, err, "should be able to read expected bytes")
 			expectedBytes := []byte(expected)
 			mExpected := make(map[interface{}]interface{})
 			require.NoError(t, yaml.Unmarshal(expectedBytes, mExpected))
-			require.Equal(t, mExpected, mActual)
+
+			resetCustomResourceLocations(mActual)
+			compareStackTemplate(t, mExpected, mActual)
 		})
 
 		testName = fmt.Sprintf("Parameter values should render properly/%s", name)
@@ -104,7 +123,7 @@ func TestGrpcLoadBalancedWebService_Template(t *testing.T) {
 			require.NoError(t, err)
 
 			path := filepath.Join("testdata", "workloads", tc.svcParamsPath)
-			wantedCFNParamsBytes, err := ioutil.ReadFile(path)
+			wantedCFNParamsBytes, err := os.ReadFile(path)
 			require.NoError(t, err)
 
 			require.Equal(t, string(wantedCFNParamsBytes), actualParams)

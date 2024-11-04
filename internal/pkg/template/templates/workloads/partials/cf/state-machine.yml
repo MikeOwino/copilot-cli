@@ -20,9 +20,11 @@ StateMachine:
       Partition: !Ref AWS::Partition
       Subnets:
       {{- if .Network.SubnetIDs}}
-        {{- range $id := .Network.SubnetIDs}}
-        - {{$id}}
-        {{- end}}
+        Fn::Join:
+          - '","'
+          - {{- range $id := .Network.SubnetIDs}}
+            - {{$id}}
+            {{- end}}
       {{- else}}
         Fn::Join:
           - '","'
@@ -34,10 +36,13 @@ StateMachine:
       SecurityGroups:
         Fn::Join:
           - '","'
-          - - Fn::ImportValue: !Sub "${AppName}-${EnvName}-EnvironmentSecurityGroup"
-            {{- range $sg := .Network.SecurityGroups }}
-            - {{$sg}}
-            {{- end }}
+          - {{if not .Network.DenyDefaultSecurityGroup}}- Fn::ImportValue: !Sub "${AppName}-${EnvName}-EnvironmentSecurityGroup" {{end}}
+            {{- range $sg := .Network.SecurityGroups}}
+            {{- if not $sg.RequiresImport}}
+            - {{$sg.Value}}
+            {{- else}}
+            - Fn::ImportValue: {{$sg.Value}} {{- end}}
+            {{- end}}
             {{- if .NestedStack}}{{$stackName := .NestedStack.StackName}}{{range $sg := .NestedStack.SecurityGroupOutputs}}
             - Fn::GetAtt: [ {{$stackName}}, Outputs.{{$sg}}]
             {{- end}}{{end}}
@@ -46,7 +51,7 @@ StateMachine:
       
 StateMachineRole:
   Metadata:
-    'aws:copilot:description': 'An IAM role for a state machine to run ECS tasks in your cluster'
+    'aws:copilot:description': 'An IAM role {{- if .PermissionsBoundary}} with permissions boundary {{.PermissionsBoundary}} {{- end}} for a state machine to run ECS tasks in your cluster'
   Type: AWS::IAM::Role
   Properties:
     AssumeRolePolicyDocument:
@@ -56,6 +61,9 @@ StateMachineRole:
         Principal:
           Service: states.amazonaws.com
         Action: sts:AssumeRole
+    {{- if .PermissionsBoundary}}
+    PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/{{.PermissionsBoundary}}'
+    {{- end}}
     Policies:
     - PolicyName: StateMachine
       PolicyDocument:

@@ -6,8 +6,6 @@ package cli
 import (
 	"fmt"
 
-	"github.com/aws/copilot-cli/internal/pkg/workspace"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -18,9 +16,12 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/describe"
 	"github.com/aws/copilot-cli/internal/pkg/runner/jobrunner"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
+	"github.com/aws/copilot-cli/internal/pkg/workspace"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
 
@@ -53,9 +54,9 @@ func newJobRunOpts(vars jobRunVars) (*jobRunOpts, error) {
 		return nil, err
 	}
 	configStore := config.NewSSMStore(identity.New(defaultSess), ssm.New(defaultSess), aws.StringValue(defaultSess.Config.Region))
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
+		return nil, err
 	}
 	prompter := prompt.New()
 
@@ -138,7 +139,7 @@ func (o *jobRunOpts) validateOrAskApp() error {
 		_, err := o.configStore.GetApplication(o.appName)
 		return err
 	}
-	app, err := o.sel.Application(jobAppNamePrompt, svcAppNameHelpPrompt)
+	app, err := o.sel.Application(jobAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application: %w", err)
 	}
@@ -203,7 +204,7 @@ func (o *jobRunOpts) validateEnvCompatible() error {
 	if err != nil {
 		return err
 	}
-	return validateMinEnvVersion(o.ws, envStack, o.appName, o.envName, "v1.12.0", "job run")
+	return validateMinEnvVersion(o.ws, envStack, o.appName, o.envName, template.JobRunMinEnvVersion, "job run")
 }
 
 func buildJobRunCmd() *cobra.Command {

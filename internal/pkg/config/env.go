@@ -19,7 +19,6 @@ type Environment struct {
 	Name             string `json:"name"`             // Name of the environment, must be unique within a App.
 	Region           string `json:"region"`           // Name of the region this environment is stored in.
 	AccountID        string `json:"accountID"`        // Account ID of the account this environment is stored in.
-	Prod             bool   `json:"prod"`             // Deprecated. Whether or not this environment is a production environment.
 	RegistryURL      string `json:"registryURL"`      // URL For ECR Registry for this environment.
 	ExecutionRoleARN string `json:"executionRoleARN"` // ARN used by CloudFormation to make modification to the environment stack.
 	ManagerRoleARN   string `json:"managerRoleARN"`   // ARN for the manager role assumed to manipulate the environment and its services.
@@ -38,12 +37,12 @@ type CustomizeEnv struct {
 	EnableInternalALBVPCIngress bool       `json:"enableInternalALBVPCIngress,omitempty"`
 }
 
-// IsEmpty returns if CustomizeEnv is an empty struct.
+// IsEmpty returns true if CustomizeEnv is an empty struct.
 func (c *CustomizeEnv) IsEmpty() bool {
 	if c == nil {
 		return true
 	}
-	return c.ImportVPC == nil && c.VPCConfig == nil && len(c.ImportCertARNs) == 0 && len(c.InternalALBSubnets) == 0
+	return c.ImportVPC == nil && c.VPCConfig == nil && len(c.ImportCertARNs) == 0 && len(c.InternalALBSubnets) == 0 && !c.EnableInternalALBVPCIngress
 }
 
 // ImportVPC holds the fields to import VPC resources.
@@ -84,6 +83,16 @@ func (s *Store) CreateEnvironment(environment *Environment) error {
 		Description: aws.String(fmt.Sprintf("The %s deployment stage", environment.Name)),
 		Type:        aws.String(ssm.ParameterTypeString),
 		Value:       aws.String(data),
+		Tags: []*ssm.Tag{
+			{
+				Key:   aws.String("copilot-application"),
+				Value: aws.String(environment.App),
+			},
+			{
+				Key:   aws.String("copilot-environment"),
+				Value: aws.String(environment.Name),
+			},
+		},
 	})
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
@@ -143,9 +152,7 @@ func (s *Store) ListEnvironments(appName string) ([]*Environment, error) {
 
 		environments = append(environments, &env)
 	}
-	// non-prod env before prod env. sort by alphabetically if same
 	sort.SliceStable(environments, func(i, j int) bool { return environments[i].Name < environments[j].Name })
-	sort.SliceStable(environments, func(i, j int) bool { return !environments[i].Prod })
 	return environments, nil
 }
 

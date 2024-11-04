@@ -22,8 +22,33 @@ You'll need to provide the URL for the sidecar image. Optionally, you can specif
 
 <div class="separator"></div>
 
-## Example
+#### Example
 
+##### Sidecars with environment overrides
+Similar to other service/job manifest fields, sidecars configurations can be overridden per-environment via the [`environments`](../manifest/lb-web-service.en.md#environments) field.
+Below is an example that configures the value for the `DD_APM_ENABLED` environment variable of the `datadog` sidecar, based on whether it is `dev` environment:
+
+```yaml
+name: api
+type: Load Balanced Web Service
+
+sidecars:
+  datadog:
+    port: 80
+    image:
+      build: src/reverseproxy/Dockerfile
+    variables:
+      DD_APM_ENABLED: true
+
+environments:
+  dev:
+    sidecars:
+      datadog:
+        variables:
+          DD_APM_ENABLED: false
+```
+
+##### [nginx](https://www.nginx.com/) sidecar container
 Below is an example of specifying the [nginx](https://www.nginx.com/) sidecar container in a load balanced web service manifest.
 
 ``` yaml
@@ -47,12 +72,13 @@ count: 1
 sidecars:
   nginx:
     port: 80
-    image: 1234567890.dkr.ecr.us-west-2.amazonaws.com/reverse-proxy:revision_1
+    image:
+      build: src/reverseproxy/Dockerfile
     variables:
       NGINX_PORT: 80
 ```
 
-Below is a fragment of a manifest including an EFS volume in both the service and sidecar container.
+##### EFS volume in both the service and sidecar container
 
 ```yaml
 storage:
@@ -73,7 +99,7 @@ sidecars:
       - source_volume: myEFSVolume
         path: '/etc/mount1'
 ```
-
+##### [AWS Distro for OpenTelemetry](https://aws-otel.github.io/) sidecar
 Below is an example of running the [AWS Distro for OpenTelemetry](https://aws-otel.github.io/) sidecar with a custom configuration. The example
 custom configuration will not only collect X-Ray trace data, but also ship ECS metrics to a third party. The example will require an SSM secret and additional IAM permissions.
 
@@ -113,7 +139,7 @@ service:
       exporters: [otlp]
 ```
 
-Writing X-Ray traces needs additional IAM permissions as shown below. Include this in addons according to the [published documentation](../developing/additional-aws-resources.en.md)
+Writing X-Ray traces needs additional IAM permissions as shown below. Include this in addons according to the [published documentation](./addons/workload.en.md)
 
 ``` yaml
 Resources:
@@ -185,7 +211,7 @@ logging:
     log_stream_prefix: copilot/
 ```
 
-You might need to add necessary permissions to the task role so that FireLens can forward your data. You can add permissions by specifying them in your [addons](../developing/additional-aws-resources.en.md). For example:
+You might need to add necessary permissions to the task role so that FireLens can forward your data. You can add permissions by specifying them in your [addons](./addons/workload.en.md). For example:
 
 ``` yaml
 Resources:
@@ -211,5 +237,3 @@ Outputs:
 !!!info
     Since the FireLens log driver can route your main container's logs to various destinations, the [`svc logs`](../commands/svc-logs.en.md) command can track them only when they are sent to the log group we create for your Copilot service in CloudWatch.
 
-!!!info
-    ** We're going to make this easier and more powerful!** Currently, we only support using remote images for sidecars, which means users need to build and push their local sidecar images. But we are planning to support using local images or Dockerfiles. Additionally, FireLens will be able to route logs for the other sidecars (not just the main container).

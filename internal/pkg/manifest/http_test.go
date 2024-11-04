@@ -11,29 +11,31 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestRoutingRuleConfigOrBool_Disabled(t *testing.T) {
+func TestHTTPOrBool_Disabled(t *testing.T) {
 	testCases := map[string]struct {
-		in     RoutingRuleConfigOrBool
+		in     HTTPOrBool
 		wanted bool
 	}{
 		"disabled": {
-			in: RoutingRuleConfigOrBool{
+			in: HTTPOrBool{
 				Enabled: aws.Bool(false),
 			},
 			wanted: true,
 		},
 		"enabled implicitly": {
-			in: RoutingRuleConfigOrBool{},
+			in: HTTPOrBool{},
 		},
 		"enabled explicitly": {
-			in: RoutingRuleConfigOrBool{
+			in: HTTPOrBool{
 				Enabled: aws.Bool(true),
 			},
 		},
 		"enabled explicitly by advanced configuration": {
-			in: RoutingRuleConfigOrBool{
-				RoutingRuleConfiguration: RoutingRuleConfiguration{
-					Path: aws.String("mockPath"),
+			in: HTTPOrBool{
+				HTTP: HTTP{
+					Main: RoutingRule{
+						Path: aws.String("mockPath"),
+					},
 				},
 			},
 		},
@@ -46,6 +48,42 @@ func TestRoutingRuleConfigOrBool_Disabled(t *testing.T) {
 
 			// THEN
 			require.Equal(t, tc.wanted, got)
+		})
+	}
+}
+
+func TestAlias_HostedZones(t *testing.T) {
+	testCases := map[string]struct {
+		in     Alias
+		wanted []string
+	}{
+		"no hosted zone": {
+			in: Alias{
+				AdvancedAliases: []AdvancedAlias{},
+			},
+			wanted: []string{},
+		},
+		"with hosted zones": {
+			in: Alias{
+				AdvancedAliases: []AdvancedAlias{
+					{
+						HostedZone: aws.String("mockHostedZone1"),
+					},
+					{
+						HostedZone: aws.String("mockHostedZone2"),
+					},
+				},
+			},
+			wanted: []string{"mockHostedZone1", "mockHostedZone2"},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			// WHEN
+			got := tc.in.HostedZones()
+			// THEN
+			require.ElementsMatch(t, tc.wanted, got)
 		})
 	}
 }
@@ -106,10 +144,12 @@ func TestAlias_UnmarshalYAML(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			r := RoutingRuleConfiguration{
-				Alias: Alias{
-					StringSliceOrString: StringSliceOrString{
-						String: aws.String("wrong"),
+			r := HTTP{
+				Main: RoutingRule{
+					Alias: Alias{
+						StringSliceOrString: StringSliceOrString{
+							String: aws.String("wrong"),
+						},
 					},
 				},
 			}
@@ -120,8 +160,8 @@ func TestAlias_UnmarshalYAML(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				// check memberwise dereferenced pointer equality
-				require.Equal(t, tc.wantedStruct.StringSliceOrString, r.Alias.StringSliceOrString)
-				require.Equal(t, tc.wantedStruct.AdvancedAliases, r.Alias.AdvancedAliases)
+				require.Equal(t, tc.wantedStruct.StringSliceOrString, r.Main.Alias.StringSliceOrString)
+				require.Equal(t, tc.wantedStruct.AdvancedAliases, r.Main.Alias.AdvancedAliases)
 			}
 		})
 	}

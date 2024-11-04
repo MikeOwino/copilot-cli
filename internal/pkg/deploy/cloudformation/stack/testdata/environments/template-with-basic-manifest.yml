@@ -18,6 +18,8 @@ Parameters:
     Type: String
   NATWorkloads:
     Type: String
+  AppRunnerPrivateWorkloads:
+    Type: String
   ToolsAccountPrincipalARN:
     Type: String
   AppDNSName:
@@ -51,9 +53,12 @@ Conditions:
     !Not [!Equals [ !Ref EFSWorkloads, ""]]
   CreateNATGateways:
     !Not [!Equals [ !Ref NATWorkloads, ""]]
+  CreateAppRunnerVPCEndpoint:
+    !Not [!Equals [ !Ref AppRunnerPrivateWorkloads, ""]]
   ManagedAliases: !And
     - !Condition DelegateDNS
     - !Not [!Equals [ !Ref Aliases, "" ]]
+    - !Condition CreateALB
 Resources:
   # The CloudformationExecutionRole definition must be immediately followed with DeletionPolicy: Retain.
   # See #1533.
@@ -71,7 +76,6 @@ Resources:
             Principal:
               Service:
                 - 'cloudformation.amazonaws.com'
-                - 'lambda.amazonaws.com'
             Action: sts:AssumeRole
       Path: /
       Policies:
@@ -158,13 +162,15 @@ Resources:
                   "ecs:DescribeTaskDefinition",
                   "ecs:ListTaskDefinitions",
                   "ecs:ListClusters",
-                  "ecs:RunTask"
+                  "ecs:RunTask",
+                  "ecs:ListServicesByNamespace"
                 ]
                 Resource: "*"
               - Sid: ExecuteCommand
                 Effect: Allow
                 Action: [
-                  "ecs:ExecuteCommand"
+                  "ecs:ExecuteCommand",
+                  "ssm:StartSession"
                 ]
                 Resource: "*"
                 Condition:
@@ -175,8 +181,9 @@ Resources:
                 Effect: Allow
                 Action:
                   - "states:StartExecution"
+                  - "states:DescribeStateMachine"
                 Resource:
-                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AppName}-${EnvironmentName}-*"
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AppName}-${EnvironmentName}-*"
               - Sid: CloudFormation
                 Effect: Allow
                 Action: [
@@ -252,6 +259,12 @@ Resources:
                 ]
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/copilot/${AppName}/${EnvironmentName}/secrets/*'
+              - Sid: SSMSession
+                Effect: Allow
+                Action:
+                  - ssm:StartSession
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartPortForwardingSessionToRemoteHost"
               - Sid: ELBv2
                 Effect: Allow
                 Action: [
@@ -341,7 +354,8 @@ Resources:
                   "apprunner:PauseService",
                   "apprunner:ResumeService",
                   "apprunner:StartDeployment",
-                  "apprunner:DescribeObservabilityConfiguration"
+                  "apprunner:DescribeObservabilityConfiguration",
+                  "apprunner:DescribeVpcIngressConnection"
                 ]
                 Resource: "*"
               - Sid: Tags
@@ -373,6 +387,17 @@ Resources:
                   - 'cloudformation:DeleteStack'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+              - Sid: ListStacks
+                Effect: Allow
+                Action:
+                  - 'cloudformation:ListStacks'
+                Resource: "*"
+              - Sid: RDS
+                Effect: Allow
+                Action:
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBClusters'
+                Resource: "*"
   
   VPC:
     Metadata:
@@ -479,6 +504,8 @@ Resources:
       SubnetId: !Ref PublicSubnet2
   
   NatGateway1Attachment:
+    Metadata:
+      'aws:copilot:description': 'An Elastic IP for NAT Gateway 1'
     Type: AWS::EC2::EIP
     Condition: CreateNATGateways
     DependsOn: InternetGatewayAttachment
@@ -514,6 +541,8 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable1
       SubnetId: !Ref PrivateSubnet1
   NatGateway2Attachment:
+    Metadata:
+      'aws:copilot:description': 'An Elastic IP for NAT Gateway 2'
     Type: AWS::EC2::EIP
     Condition: CreateNATGateways
     DependsOn: InternetGatewayAttachment
@@ -586,7 +615,7 @@ Resources:
       VpcId: !Ref VPC
       Tags:
         - Key: Name
-          Value: !Sub 'copilot-${AppName}-${EnvironmentName}-lb'
+          Value: !Sub 'copilot-${AppName}-${EnvironmentName}-lb-http'
   PublicHTTPSLoadBalancerSecurityGroup:
     Metadata:
       'aws:copilot:description': 'A security group for your load balancer allowing HTTPS traffic'
@@ -603,7 +632,7 @@ Resources:
       VpcId: !Ref VPC
       Tags:
         - Key: Name
-          Value: !Sub 'copilot-${AppName}-${EnvironmentName}-lb'
+          Value: !Sub 'copilot-${AppName}-${EnvironmentName}-lb-https'
   InternalLoadBalancerSecurityGroup:
     Metadata:
       'aws:copilot:description': 'A security group for your internal load balancer allowing HTTP traffic from within the VPC'
@@ -671,6 +700,9 @@ Resources:
     Condition: CreateALB
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
+      LoadBalancerAttributes:
+        - Key: 'access_logs.s3.enabled'
+          Value: false
       Scheme: internet-facing
       SecurityGroups: 
         - !GetAtt PublicHTTPLoadBalancerSecurityGroup.GroupId
@@ -906,40 +938,31 @@ Resources:
     Type: AWS::Lambda::Function
     Condition: DelegateDNS
     Properties:
-      Code:
-        S3Bucket: mockbucket
-        S3Key: dns-cert-validator
       Handler: "index.certificateRequestHandler"
       Timeout: 900
       MemorySize: 512
       Role: !GetAtt 'CustomResourceRole.Arn'
-      Runtime: nodejs12.x
+      Runtime: nodejs20.x
   
   CustomDomainFunction:
     Condition: ManagedAliases
     Type: AWS::Lambda::Function
     Properties:
-      Code:
-        S3Bucket: mockbucket
-        S3Key: custom-domain
       Handler: "index.handler"
       Timeout: 600
       MemorySize: 512
       Role: !GetAtt 'CustomResourceRole.Arn'
-      Runtime: nodejs12.x
+      Runtime: nodejs20.x
   
   DNSDelegationFunction:
     Type: AWS::Lambda::Function
     Condition: DelegateDNS
     Properties:
-      Code:
-        S3Bucket: mockbucket
-        S3Key: dns-delegation
       Handler: "index.domainDelegationHandler"
       Timeout: 600
       MemorySize: 512
       Role: !GetAtt 'CustomResourceRole.Arn'
-      Runtime: nodejs12.x
+      Runtime: nodejs20.x
   DelegateDNSAction:
     Metadata:
       'aws:copilot:description': 'Delegate DNS for environment subdomain'
@@ -986,8 +1009,78 @@ Resources:
       Aliases: !Ref Aliases
       AppDNSRole: !Ref AppDNSDelegationRole
       DomainName: !Ref AppDNSName
-      LoadBalancerDNS: !GetAtt PublicLoadBalancer.DNSName
-      LoadBalancerHostedZone: !GetAtt PublicLoadBalancer.CanonicalHostedZoneID
+      PublicAccessDNS: !GetAtt PublicLoadBalancer.DNSName
+      PublicAccessHostedZone: !GetAtt PublicLoadBalancer.CanonicalHostedZoneID
+  AppRunnerVpcEndpointSecurityGroup:
+    Metadata:
+      'aws:copilot:description': 'A security group for App Runner private services'
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateAppRunnerVPCEndpoint
+    Properties:
+      GroupDescription: demo-test-AppRunnerVpcEndpointSecurityGroup
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: copilot-demo-test-app-runner-vpc-endpoint
+  
+  AppRunnerVpcEndpointSecurityGroupIngressFromEnvironment:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: CreateAppRunnerVPCEndpoint
+    Properties:
+      Description: Ingress from services in the environment
+      GroupId: !Ref AppRunnerVpcEndpointSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EnvironmentSecurityGroup
+  
+  AppRunnerVpcEndpoint:
+    Metadata:
+      'aws:copilot:description': 'VPC Endpoint to connect environment to App Runner for private services'
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateAppRunnerVPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+      SecurityGroupIds:
+        - !Ref AppRunnerVpcEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.apprunner.requests'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+  LogResourcePolicy:
+    Metadata:
+      'aws:copilot:description': 'A resource policy to allow AWS services to create log streams for your workloads.'
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${AppName}-${EnvironmentName}-LogResourcePolicy'
+      PolicyDocument:
+        Fn::Sub: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "StateMachineToCloudWatchLogs",
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": ["delivery.logs.amazonaws.com"]
+                },
+                "Action": [
+                  "logs:CreateLogStream",
+                  "logs:PutLogEvents"
+                ],
+                "Resource": [
+                  "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/copilot/${AppName}-${EnvironmentName}-*:log-stream:*"
+                ],
+                "Condition": {
+                  "StringEquals": {
+                    "aws:SourceAccount": "${AWS::AccountId}"
+                  },
+                  "ArnLike": {
+                    "aws:SourceArn": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            ]
+          }
 Outputs:
   VpcId:
     Value: !Ref VPC
@@ -1069,7 +1162,7 @@ Outputs:
       Name: !Sub ${AWS::StackName}-InternalLoadBalancerCanonicalHostedZoneID
   InternalWorkloadsHostedZone:
     Condition: CreateInternalALB
-    Value: !GetAtt InternalWorkloadsHostedZone.Id
+    Value: !Ref InternalWorkloadsHostedZone
     Export:
       Name: !Sub ${AWS::StackName}-InternalWorkloadsHostedZoneID
   InternalWorkloadsHostedZoneName:
@@ -1119,7 +1212,7 @@ Outputs:
     Export:
       Name: !Sub ${AWS::StackName}-SubDomain
   EnabledFeatures:
-    Value: !Sub '${ALBWorkloads},${InternalALBWorkloads},${EFSWorkloads},${NATWorkloads},${Aliases}'
+    Value: !Sub '${ALBWorkloads},${InternalALBWorkloads},${EFSWorkloads},${NATWorkloads},${Aliases},${AppRunnerPrivateWorkloads}'
     Description: Required output to force the stack to update if mutating feature params, like ALBWorkloads, does not change the template.
   ManagedFileSystemID:
     Condition: CreateEFS
@@ -1133,3 +1226,9 @@ Outputs:
   LastForceDeployID:
     Value: ""
     Description: Optionally force the template to update when no immediate resource change is present.
+  AppRunnerVpcEndpointId:
+    Condition: CreateAppRunnerVPCEndpoint
+    Value: !Ref AppRunnerVpcEndpoint
+    Description: VPC Endpoint to App Runner for private services
+    Export:
+      Name: !Sub ${AWS::StackName}-AppRunnerVpcEndpointId

@@ -2,10 +2,9 @@ List of all available properties for a `'Backend Service'` manifest. To learn ab
 
 ???+ note "Sample backend service manifests"
 
-    === "Service Discovery"
+    === "Serving Internal Traffic"
 
         ```yaml
-            # Your service is reachable at "http://api.${COPILOT_SERVICE_DISCOVERY_ENDPOINT}:8080" only within your VPC.
             name: api
             type: Backend Service
 
@@ -18,12 +17,15 @@ List of all available properties for a `'Backend Service'` manifest. To learn ab
                 retries: 2
                 timeout: 5s
                 start_period: 0s
-    
+
+            network:
+              connect: true
+
             cpu: 256
             memory: 512
             count: 2
             exec: true
-    
+
             env_file: ./api/.env
             environments:
               test:
@@ -40,7 +42,7 @@ List of all available properties for a `'Backend Service'` manifest. To learn ab
         # behind an internal load balancer only within your VPC.
         name: api
         type: Backend Service
-    
+
         image:
           build: ./api/Dockerfile
           port: 8080
@@ -69,7 +71,7 @@ List of all available properties for a `'Backend Service'` manifest. To learn ab
         secrets:
           GITHUB_WEBHOOK_SECRET: GH_WEBHOOK_SECRET
           DB_PASSWORD:
-            secretsmanager: 'demo/test/mysql:password::'
+            secretsmanager: 'mysql:password::'
         ```
 
     === "With a domain"
@@ -80,7 +82,7 @@ List of all available properties for a `'Backend Service'` manifest. To learn ab
         # See https://aws.github.io/copilot-cli/docs/manifest/environment/#http-private-certificates
         name: api
         type: Backend Service
-    
+
         image:
           build: ./api/Dockerfile
           port: 8080
@@ -99,7 +101,7 @@ List of all available properties for a `'Backend Service'` manifest. To learn ab
         # See https://aws.github.io/copilot-cli/docs/developing/publish-subscribe/
         name: warehouse
         type: Backend Service
-    
+
         image:
           build: ./warehouse/Dockerfile
           port: 80
@@ -107,6 +109,8 @@ List of all available properties for a `'Backend Service'` manifest. To learn ab
         publish:
           topics:
             - name: 'inventory'
+            - name: 'orders'
+              fifo: true
 
         variables:
           DDB_TABLE_NAME: 'inventory'
@@ -132,11 +136,37 @@ List of all available properties for a `'Backend Service'` manifest. To learn ab
 
         storage:
           volumes:
-            userdata: 
+            userdata:
               path: /etc/mount1
               efs:
                 id: fs-1234567
         ```
+
+    === "Expose Multiple Ports"
+
+        ```yaml
+        name: 'backend'
+        type: 'Backend Service'
+    
+        image:
+          build: './backend/Dockerfile'
+          port: 8080
+    
+        http:
+          path: '/'
+          target_port: 8083           # Traffic on "/" is forwarded to the main container, on port 8083. 
+          additional_rules:
+            - path: 'customerdb'
+              target_port: 8081       # Traffic on "/customerdb" is forwarded to the main container, on port 8081.
+            - path: 'admin' 
+              target_port: 8082       # Traffic on "/admin" is forwarded to the sidecar "envoy", on port 8082.
+              target_container: envoy
+    
+        sidecars:
+          envoy:
+            port: 80
+            image: aws_account_id.dkr.ecr.us-west-2.amazonaws.com/envoy-proxy-with-selfsigned-certs:v1
+        ```    
 
 <a id="name" href="#name" class="field">`name`</a> <span class="type">String</span>
 The name of your service.
@@ -144,7 +174,7 @@ The name of your service.
 <div class="separator"></div>
 
 <a id="type" href="#type" class="field">`type`</a> <span class="type">String</span>  
-The architecture type for your service. [Backend Services](../concepts/services.en.md#backend-service) are not reachable from the internet, but can be reached with [service discovery](../developing/service-discovery.en.md) from your other services.
+The architecture type for your service. [Backend Services](../concepts/services.en.md#backend-service) are not reachable from the internet, but can be reached with [service discovery](../developing/svc-to-svc-communication.en.md#service-discovery) from your other services.
 
 <div class="separator"></div>
 
@@ -154,13 +184,18 @@ The http section contains parameters related to integrating your service with an
 <span class="parent-field">http.</span><a id="http-path" href="#http-path" class="field">`path`</a> <span class="type">String</span>  
 Requests to this path will be forwarded to your service. Each Backend Service should listen on a unique path.
 
+<span class="parent-field">http.</span><a id="http-alb" href="#http-alb" class="field">`alb`</a> <span class="type">String</span> <span class="version">Added in [v1.33.0](../../blogs/release-v133.en.md#imported-albs)</span>  
+The ARN or name of an existing internal ALB to import. Listener rules will be added to your listener(s). Copilot will not manage DNS-related resources like certificates.
+
 {% include 'http-healthcheck.en.md' %}
 
 <span class="parent-field">http.</span><a id="http-deregistration-delay" href="#http-deregistration-delay" class="field">`deregistration_delay`</a> <span class="type">Duration</span>  
 The amount of time to wait for targets to drain connections during deregistration. The default is 60s. Setting this to a larger value gives targets more time to gracefully drain connections, but increases the time required for new deployments. Range 0s-3600s.
 
 <span class="parent-field">http.</span><a id="http-target-container" href="#http-target-container" class="field">`target_container`</a> <span class="type">String</span>  
-A sidecar container that takes the place of a service container.
+A sidecar container that requests are routed to instead of the main service container.  
+If the target container's port is set to `443`, then the protocol is set to `HTTPS` so that the load balancer establishes
+TLS connections with the Fargate tasks using certificates that you install on the target container.
 
 <span class="parent-field">http.</span><a id="http-stickiness" href="#http-stickiness" class="field">`stickiness`</a> <span class="type">Boolean</span>  
 Indicates whether sticky sessions are enabled.
@@ -201,7 +236,14 @@ http:
 The HTTP(S) protocol version. Must be one of `'grpc'`, `'http1'`, or `'http2'`. If omitted, then `'http1'` is assumed.
 If using gRPC, please note that a domain must be associated with your application.
 
-{% include 'image-config-with-port.en.md' %}
+<span class="parent-field">http.</span><a id="http-additional-rules" href="#http-additional-rules" class="field">`additional_rules`</a> <span class="type">Array of Maps</span>  
+Configure multiple ALB listener rules.
+
+{% include 'http-additionalrules.en.md' %}
+
+{% include 'image-config-with-port.en.md' %}  
+If the port is set to `443` and an internal load balancer is enabled with `http`, then the protocol is set to `HTTPS` so that the load balancer establishes
+TLS connections with the Fargate tasks using certificates that you install on the container.
 
 {% include 'image-healthcheck.en.md' %}
 
@@ -211,7 +253,7 @@ If using gRPC, please note that a domain must be associated with your applicatio
 
 <div class="separator"></div>
 
-<a id="count" href="#count" class="field">`count`</a> <span class="type">Integer or Map</span> 
+<a id="count" href="#count" class="field">`count`</a> <span class="type">Integer or Map</span>
 The number of tasks that your service should maintain.
 
 If you specify a number:
@@ -309,6 +351,12 @@ Scale up or down based on the service average response time.
 {% include 'exec.en.md' %}
 
 {% include 'deployment.en.md' %}
+```yaml
+deployment:
+  rollback_alarms:
+    cpu_utilization: 70    // Percentage value at or above which alarm is triggered.
+    memory_utilization: 50 // Percentage value at or above which alarm is triggered.
+```
 
 {% include 'entrypoint.en.md' %}
 

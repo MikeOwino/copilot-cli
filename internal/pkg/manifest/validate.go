@@ -9,12 +9,17 @@ import (
 	"net"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/arn"
+	"github.com/aws/copilot-cli/internal/pkg/aws/cloudfront"
 	"github.com/aws/copilot-cli/internal/pkg/graph"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/dustin/go-humanize/english"
 )
 
@@ -33,12 +38,28 @@ const (
 )
 
 const (
-	// Protocols.
+	// TCP is the tcp protocol for NLB.
 	TCP = "TCP"
-	tls = "TLS"
+
+	// TLS is the tls protocol for NLB.
+	TLS = "TLS"
+
+	// UDP is the udp protocol for NLB.
+	UDP = "UDP"
 
 	// Tracing vendors.
 	awsXRAY = "awsxray"
+)
+
+const (
+	defaultProtocol = TCP
+)
+
+const (
+	// Listener rules have a quota of five condition values per rule.
+	// Please refer to https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-limits.html.
+	maxConditionsPerRule = 5
+	rootPath             = "/"
 )
 
 var (
@@ -51,13 +72,17 @@ var (
 
 	essentialContainerDependsOnValidStatuses = []string{dependsOnStart, dependsOnHealthy}
 	dependsOnValidStatuses                   = []string{dependsOnStart, dependsOnComplete, dependsOnSuccess, dependsOnHealthy}
-	nlbValidProtocols                        = []string{TCP, tls}
-	TracingValidVendors                      = []string{awsXRAY}
+	nlbValidProtocols                        = []string{TCP, UDP, TLS}
+	validContainerProtocols                  = []string{TCP, UDP}
+	validHealthCheckProtocols                = []string{TCP}
+	tracingValidVendors                      = []string{awsXRAY}
 	ecsRollingUpdateStrategies               = []string{ECSDefaultRollingUpdateStrategy, ECSRecreateRollingUpdateStrategy}
 
 	httpProtocolVersions = []string{"GRPC", "HTTP1", "HTTP2"}
 
-	invalidTaskDefOverridePathRegexp = []string{`Family`, `ContainerDefinitions\[\d+\].Name`}
+	invalidTaskDefOverridePathRegexp  = []string{`Family`, `ContainerDefinitions\[\d+\].Name`}
+	validSQSDeduplicationScopeValues  = []string{sqsDeduplicationScopeMessageGroup, sqsDeduplicationScopeQueue}
+	validSQSFIFOThroughputLimitValues = []string{sqsFIFOThroughputLimitPerMessageGroupID, sqsFIFOThroughputLimitPerQueue}
 )
 
 // Validate returns nil if DynamicLoadBalancedWebService is configured correctly.
@@ -76,17 +101,39 @@ func (l LoadBalancedWebService) validate() error {
 	}
 	if err = validateTargetContainer(validateTargetContainerOpts{
 		mainContainerName: aws.StringValue(l.Name),
-		targetContainer:   l.RoutingRule.GetTargetContainer(),
+		mainContainerPort: l.ImageConfig.Port,
+		targetContainer:   l.HTTPOrBool.Main.TargetContainer,
 		sidecarConfig:     l.Sidecars,
 	}); err != nil {
-		return fmt.Errorf("validate HTTP load balancer target: %w", err)
+		return fmt.Errorf(`validate load balancer target for "http": %w`, err)
+	}
+	for idx, rule := range l.HTTPOrBool.AdditionalRoutingRules {
+		if err = validateTargetContainer(validateTargetContainerOpts{
+			mainContainerName: aws.StringValue(l.Name),
+			mainContainerPort: l.ImageConfig.Port,
+			targetContainer:   rule.TargetContainer,
+			sidecarConfig:     l.Sidecars,
+		}); err != nil {
+			return fmt.Errorf(`validate load balancer target for "http.additional_rules[%d]": %w`, idx, err)
+		}
 	}
 	if err = validateTargetContainer(validateTargetContainerOpts{
 		mainContainerName: aws.StringValue(l.Name),
-		targetContainer:   l.NLBConfig.TargetContainer,
+		mainContainerPort: l.ImageConfig.Port,
+		targetContainer:   l.NLBConfig.Listener.TargetContainer,
 		sidecarConfig:     l.Sidecars,
 	}); err != nil {
-		return fmt.Errorf("validate network load balancer target: %w", err)
+		return fmt.Errorf(`validate target for "nlb": %w`, err)
+	}
+	for idx, listener := range l.NLBConfig.AdditionalListeners {
+		if err = validateTargetContainer(validateTargetContainerOpts{
+			mainContainerName: aws.StringValue(l.Name),
+			mainContainerPort: l.ImageConfig.Port,
+			targetContainer:   listener.TargetContainer,
+			sidecarConfig:     l.Sidecars,
+		}); err != nil {
+			return fmt.Errorf(`validate target for "nlb.additional_listeners[%d]": %w`, idx, err)
+		}
 	}
 	if err = validateContainerDeps(validateDependenciesOpts{
 		sidecarConfig:     l.Sidecars,
@@ -96,32 +143,90 @@ func (l LoadBalancedWebService) validate() error {
 	}); err != nil {
 		return fmt.Errorf("validate container dependencies: %w", err)
 	}
+	if err = validateExposedPorts(validateExposedPortsOpts{
+		mainContainerName: aws.StringValue(l.Name),
+		mainContainerPort: l.ImageConfig.Port,
+		sidecarConfig:     l.Sidecars,
+		alb:               &l.HTTPOrBool.HTTP,
+		nlb:               &l.NLBConfig,
+	}); err != nil {
+		return fmt.Errorf("validate unique exposed ports: %w", err)
+	}
+	ports, err := l.ExposedPorts()
+	if err != nil {
+		return err
+	}
+	if err = validateHealthCheckPorts(validateHealthCheckPortsOpts{
+		exposedPorts:      ports,
+		mainContainerPort: l.ImageConfig.Port,
+		alb:               l.HTTPOrBool.HTTP,
+		nlb:               l.NLBConfig,
+	}); err != nil {
+		return fmt.Errorf("validate load balancer health check ports: %w", err)
+	}
 	return nil
 }
 
-func (d DeploymentConfiguration) validate() error {
+func (d DeploymentConfig) validate() error {
 	if d.isEmpty() {
 		return nil
 	}
-	for _, validStrategy := range ecsRollingUpdateStrategies {
-		if strings.EqualFold(aws.StringValue(d.Rolling), validStrategy) {
-			return nil
-		}
+	if err := d.RollbackAlarms.validate(); err != nil {
+		return fmt.Errorf(`validate "rollback_alarms": %w`, err)
 	}
-	return fmt.Errorf("invalid rolling deployment strategy %s, must be one of %s",
-		aws.StringValue(d.Rolling),
-		english.WordSeries(ecsRollingUpdateStrategies, "or"))
+	if err := d.DeploymentControllerConfig.validate(); err != nil {
+		return fmt.Errorf(`validate "rolling": %w`, err)
+	}
+	return nil
+}
+
+func (w WorkerDeploymentConfig) validate() error {
+	if w.isEmpty() {
+		return nil
+	}
+	if err := w.WorkerRollbackAlarms.validate(); err != nil {
+		return fmt.Errorf(`validate "rollback_alarms": %w`, err)
+	}
+	if err := w.DeploymentControllerConfig.validate(); err != nil {
+		return fmt.Errorf(`validate "deployment controller strategy": %w`, err)
+	}
+	return nil
+}
+
+func (d DeploymentControllerConfig) validate() error {
+	if d.Rolling != nil {
+		for _, validStrategy := range ecsRollingUpdateStrategies {
+			if strings.EqualFold(aws.StringValue(d.Rolling), validStrategy) {
+				return nil
+			}
+		}
+		return fmt.Errorf("invalid rolling deployment strategy %q, must be one of %s",
+			aws.StringValue(d.Rolling),
+			english.WordSeries(ecsRollingUpdateStrategies, "or"))
+	}
+	return nil
+}
+
+func (a AlarmArgs) validate() error {
+	return nil
+}
+
+func (w WorkerAlarmArgs) validate() error {
+	return nil
 }
 
 // validate returns nil if LoadBalancedWebServiceConfig is configured correctly.
 func (l LoadBalancedWebServiceConfig) validate() error {
 	var err error
-	if l.RoutingRule.Disabled() && l.NLBConfig.IsEmpty() {
+	if l.HTTPOrBool.Disabled() && l.NLBConfig.IsEmpty() {
 		return &errAtLeastOneFieldMustBeSpecified{
 			missingFields: []string{"http", "nlb"},
 		}
 	}
-	if l.RoutingRule.Disabled() && (!l.Count.AdvancedCount.Requests.IsEmpty() || !l.Count.AdvancedCount.ResponseTime.IsEmpty()) {
+	if err = l.validateGracePeriod(); err != nil {
+		return fmt.Errorf(`validate "grace_period": %w`, err)
+	}
+	if l.HTTPOrBool.Disabled() && (!l.Count.AdvancedCount.Requests.IsEmpty() || !l.Count.AdvancedCount.ResponseTime.IsEmpty()) {
 		return errors.New(`scaling based on "nlb" requests or response time is not supported`)
 	}
 	if err = l.ImageConfig.validate(); err != nil {
@@ -130,7 +235,12 @@ func (l LoadBalancedWebServiceConfig) validate() error {
 	if err = l.ImageOverride.validate(); err != nil {
 		return err
 	}
-	if err = l.RoutingRule.validate(); err != nil {
+	if l.HTTPOrBool.isEmpty() {
+		return &errFieldMustBeSpecified{
+			missingField: "http",
+		}
+	}
+	if err = l.HTTPOrBool.validate(); err != nil {
 		return fmt.Errorf(`validate "http": %w`, err)
 	}
 	if err = l.TaskConfig.validate(); err != nil {
@@ -158,16 +268,12 @@ func (l LoadBalancedWebServiceConfig) validate() error {
 	if l.TaskConfig.IsWindows() {
 		if err = validateWindows(validateWindowsOpts{
 			efsVolumes: l.Storage.Volumes,
+			readOnlyFS: l.Storage.ReadonlyRootFS,
 		}); err != nil {
 			return fmt.Errorf("validate Windows: %w", err)
 		}
-	}
-	if l.TaskConfig.IsARM() {
-		if err = validateARM(validateARMOpts{
-			Spot:     l.Count.AdvancedCount.Spot,
-			SpotFrom: l.Count.AdvancedCount.Range.RangeConfig.SpotFrom,
-		}); err != nil {
-			return fmt.Errorf("validate ARM: %w", err)
+		if l.Network.Connect.Enabled() {
+			return fmt.Errorf("validate Windows: service connect (`network.connect`) is not supported for Windows")
 		}
 	}
 	if err = l.NLBConfig.validate(); err != nil {
@@ -191,6 +297,24 @@ func (b BackendService) validate() error {
 	if err = b.Workload.validate(); err != nil {
 		return err
 	}
+	if err = validateTargetContainer(validateTargetContainerOpts{
+		mainContainerName: aws.StringValue(b.Name),
+		mainContainerPort: b.ImageConfig.Port,
+		targetContainer:   b.HTTP.Main.TargetContainer,
+		sidecarConfig:     b.Sidecars,
+	}); err != nil {
+		return fmt.Errorf(`validate load balancer target for "http": %w`, err)
+	}
+	for idx, rule := range b.HTTP.AdditionalRoutingRules {
+		if err = validateTargetContainer(validateTargetContainerOpts{
+			mainContainerName: aws.StringValue(b.Name),
+			mainContainerPort: b.ImageConfig.Port,
+			targetContainer:   rule.TargetContainer,
+			sidecarConfig:     b.Sidecars,
+		}); err != nil {
+			return fmt.Errorf(`validate load balancer target for "http.additional_rules[%d]": %w`, idx, err)
+		}
+	}
 	if err = validateContainerDeps(validateDependenciesOpts{
 		sidecarConfig:     b.Sidecars,
 		imageConfig:       b.ImageConfig.Image,
@@ -198,6 +322,25 @@ func (b BackendService) validate() error {
 		logging:           b.Logging,
 	}); err != nil {
 		return fmt.Errorf("validate container dependencies: %w", err)
+	}
+	if err = validateExposedPorts(validateExposedPortsOpts{
+		mainContainerName: aws.StringValue(b.Name),
+		mainContainerPort: b.ImageConfig.Port,
+		sidecarConfig:     b.Sidecars,
+		alb:               &b.HTTP,
+	}); err != nil {
+		return fmt.Errorf("validate unique exposed ports: %w", err)
+	}
+	exposedPortsIndex, err := b.ExposedPorts()
+	if err != nil {
+		return err
+	}
+	if err = validateHealthCheckPorts(validateHealthCheckPortsOpts{
+		exposedPorts:      exposedPortsIndex,
+		mainContainerPort: b.ImageConfig.Port,
+		alb:               b.HTTP,
+	}); err != nil {
+		return fmt.Errorf("validate load balancer health check ports: %w", err)
 	}
 	return nil
 }
@@ -211,10 +354,10 @@ func (b BackendServiceConfig) validate() error {
 	if err = b.ImageOverride.validate(); err != nil {
 		return err
 	}
-	if err = b.RoutingRule.validate(); err != nil {
+	if err = b.HTTP.validate(); err != nil {
 		return fmt.Errorf(`validate "http": %w`, err)
 	}
-	if b.RoutingRule.IsEmpty() && (!b.Count.AdvancedCount.Requests.IsEmpty() || !b.Count.AdvancedCount.ResponseTime.IsEmpty()) {
+	if b.HTTP.IsEmpty() && (!b.Count.AdvancedCount.Requests.IsEmpty() || !b.Count.AdvancedCount.ResponseTime.IsEmpty()) {
 		return &errFieldMustBeSpecified{
 			missingField:      "http",
 			conditionalFields: []string{"count.requests", "count.response_time"},
@@ -234,6 +377,11 @@ func (b BackendServiceConfig) validate() error {
 	if err = b.Network.validate(); err != nil {
 		return fmt.Errorf(`validate "network": %w`, err)
 	}
+	if b.Network.Connect.Alias != nil {
+		if b.HTTP.Main.TargetContainer == nil && b.ImageConfig.Port == nil {
+			return fmt.Errorf(`cannot set "network.connect.alias" when no ports are exposed`)
+		}
+	}
 	if err = b.PublishConfig.validate(); err != nil {
 		return fmt.Errorf(`validate "publish": %w`, err)
 	}
@@ -245,16 +393,12 @@ func (b BackendServiceConfig) validate() error {
 	if b.TaskConfig.IsWindows() {
 		if err = validateWindows(validateWindowsOpts{
 			efsVolumes: b.Storage.Volumes,
+			readOnlyFS: b.Storage.ReadonlyRootFS,
 		}); err != nil {
 			return fmt.Errorf("validate Windows: %w", err)
 		}
-	}
-	if b.TaskConfig.IsARM() {
-		if err = validateARM(validateARMOpts{
-			Spot:     b.Count.AdvancedCount.Spot,
-			SpotFrom: b.Count.AdvancedCount.Range.RangeConfig.SpotFrom,
-		}); err != nil {
-			return fmt.Errorf("validate ARM: %w", err)
+		if b.Network.Connect.Enabled() {
+			return fmt.Errorf("validate Windows: service connect (`network.connect`) is not supported for Windows")
 		}
 	}
 	return nil
@@ -289,7 +433,7 @@ func (r RequestDrivenWebServiceConfig) validate() error {
 	if r.Network.VPC.Placement.PlacementString != nil &&
 		*r.Network.VPC.Placement.PlacementString != PrivateSubnetPlacement {
 		return fmt.Errorf(`placement %q is not supported for %s`,
-			*r.Network.VPC.Placement.PlacementString, RequestDrivenWebServiceType)
+			*r.Network.VPC.Placement.PlacementString, manifestinfo.RequestDrivenWebServiceType)
 	}
 	if err = r.Observability.validate(); err != nil {
 		return fmt.Errorf(`validate "observability": %w`, err)
@@ -300,9 +444,6 @@ func (r RequestDrivenWebServiceConfig) validate() error {
 // validate returns nil if WorkerService is configured correctly.
 func (w WorkerService) validate() error {
 	var err error
-	if err = w.DeployConfig.validate(); err != nil {
-		return fmt.Errorf(`validate "deployment": %w`, err)
-	}
 	if err = w.WorkerServiceConfig.validate(); err != nil {
 		return err
 	}
@@ -317,12 +458,20 @@ func (w WorkerService) validate() error {
 	}); err != nil {
 		return fmt.Errorf("validate container dependencies: %w", err)
 	}
+	if err = validateExposedPorts(validateExposedPortsOpts{
+		sidecarConfig: w.Sidecars,
+	}); err != nil {
+		return fmt.Errorf("validate unique exposed ports: %w", err)
+	}
 	return nil
 }
 
 // validate returns nil if WorkerServiceConfig is configured correctly.
 func (w WorkerServiceConfig) validate() error {
 	var err error
+	if err = w.DeployConfig.validate(); err != nil {
+		return fmt.Errorf(`validate "deployment": %w`, err)
+	}
 	if err = w.ImageConfig.validate(); err != nil {
 		return fmt.Errorf(`validate "image": %w`, err)
 	}
@@ -343,6 +492,9 @@ func (w WorkerServiceConfig) validate() error {
 	if err = w.Network.validate(); err != nil {
 		return fmt.Errorf(`validate "network": %w`, err)
 	}
+	if w.Network.Connect.Alias != nil {
+		return fmt.Errorf(`cannot set "network.connect.alias" when no ports are exposed`)
+	}
 	if err = w.Subscribe.validate(); err != nil {
 		return fmt.Errorf(`validate "subscribe": %w`, err)
 	}
@@ -357,16 +509,9 @@ func (w WorkerServiceConfig) validate() error {
 	if w.TaskConfig.IsWindows() {
 		if err = validateWindows(validateWindowsOpts{
 			efsVolumes: w.Storage.Volumes,
+			readOnlyFS: w.Storage.ReadonlyRootFS,
 		}); err != nil {
 			return fmt.Errorf(`validate Windows: %w`, err)
-		}
-	}
-	if w.TaskConfig.IsARM() {
-		if err = validateARM(validateARMOpts{
-			Spot:     w.Count.AdvancedCount.Spot,
-			SpotFrom: w.Count.AdvancedCount.Range.RangeConfig.SpotFrom,
-		}); err != nil {
-			return fmt.Errorf("validate ARM: %w", err)
 		}
 	}
 	return nil
@@ -388,6 +533,11 @@ func (s ScheduledJob) validate() error {
 		logging:           s.Logging,
 	}); err != nil {
 		return fmt.Errorf("validate container dependencies: %w", err)
+	}
+	if err = validateExposedPorts(validateExposedPortsOpts{
+		sidecarConfig: s.Sidecars,
+	}); err != nil {
+		return fmt.Errorf("validate unique exposed ports: %w", err)
 	}
 	return nil
 }
@@ -432,30 +582,111 @@ func (s ScheduledJobConfig) validate() error {
 	if s.TaskConfig.IsWindows() {
 		if err = validateWindows(validateWindowsOpts{
 			efsVolumes: s.Storage.Volumes,
+			readOnlyFS: s.Storage.ReadonlyRootFS,
 		}); err != nil {
 			return fmt.Errorf(`validate Windows: %w`, err)
-		}
-	}
-	if s.TaskConfig.IsARM() {
-		if err = validateARM(validateARMOpts{
-			Spot:     s.Count.AdvancedCount.Spot,
-			SpotFrom: s.Count.AdvancedCount.Range.RangeConfig.SpotFrom,
-		}); err != nil {
-			return fmt.Errorf("validate ARM: %w", err)
 		}
 	}
 	return nil
 }
 
-// validate returns nil if the pipeline manifest is configured correctly.
+// validate returns nil if StaticSite is configured correctly.
+func (s StaticSite) validate() error {
+	if err := s.StaticSiteConfig.validate(); err != nil {
+		return err
+	}
+	return s.Workload.validate()
+}
+
+func (s StaticSiteConfig) validate() error {
+	if err := s.HTTP.validate(); err != nil {
+		return fmt.Errorf(`validate "http": %w`, err)
+	}
+	for idx, fileupload := range s.FileUploads {
+		if err := fileupload.validate(); err != nil {
+			return fmt.Errorf(`validate "files[%d]": %w`, idx, err)
+		}
+	}
+	return nil
+}
+
+func (f FileUpload) validate() error {
+	return f.validateSource()
+}
+
+func (s StaticSiteHTTP) validate() error {
+	if s.Certificate != "" {
+		if s.Alias == "" {
+			return &errFieldMustBeSpecified{
+				missingField:      "alias",
+				conditionalFields: []string{"certificate"},
+			}
+		}
+		certARN, err := arn.Parse(s.Certificate)
+		if err != nil {
+			return fmt.Errorf(`parse cdn certificate: %w`, err)
+		}
+		if certARN.Region != cloudfront.CertRegion {
+			return &errInvalidCloudFrontRegion{}
+		}
+	}
+	return nil
+}
+
+// validateSource returns nil if Source is configured correctly.
+func (f FileUpload) validateSource() error {
+	if f.Source == "" {
+		return &errFieldMustBeSpecified{
+			missingField: "source",
+		}
+	}
+	return nil
+}
+
+// Validate returns nil if the pipeline manifest is configured correctly.
 func (p Pipeline) Validate() error {
 	if len(p.Name) > 100 {
 		return fmt.Errorf(`pipeline name '%s' must be shorter than 100 characters`, p.Name)
 	}
 	for _, stg := range p.Stages {
+		if err := stg.validate(); err != nil {
+			return fmt.Errorf(`validate stage %q for pipeline %q: %w`, stg.Name, p.Name, err)
+		}
 		if err := stg.Deployments.validate(); err != nil {
 			return fmt.Errorf(`validate "deployments" for pipeline stage %s: %w`, stg.Name, err)
 		}
+	}
+	return nil
+}
+
+// validate returns nil if stages are configured correctly.
+func (s PipelineStage) validate() error {
+	if len(s.TestCommands) != 0 && s.PostDeployments != nil {
+		return &errFieldMutualExclusive{
+			firstField:  "post_deployments",
+			secondField: "test_commands",
+			mustExist:   false,
+		}
+	}
+	if s.PreDeployments != nil {
+		for _, preDep := range s.PreDeployments {
+			if preDep.BuildspecPath == "" {
+				return &errFieldMustBeSpecified{
+					missingField: "buildspec",
+				}
+			}
+		}
+
+	}
+	if s.PostDeployments != nil {
+		for _, postDep := range s.PostDeployments {
+			if postDep.BuildspecPath == "" {
+				return &errFieldMustBeSpecified{
+					missingField: "buildspec",
+				}
+			}
+		}
+
 	}
 	return nil
 }
@@ -546,15 +777,8 @@ func (i ImageWithPort) validate() error {
 // validate returns nil if Image is configured correctly.
 func (i Image) validate() error {
 	var err error
-	if err = i.Build.validate(); err != nil {
-		return fmt.Errorf(`validate "build": %w`, err)
-	}
-	if i.Build.isEmpty() == (i.Location == nil) {
-		return &errFieldMutualExclusive{
-			firstField:  "build",
-			secondField: "location",
-			mustExist:   true,
-		}
+	if err := i.ImageLocationOrBuild.validate(); err != nil {
+		return err
 	}
 	if err = i.DependsOn.validate(); err != nil {
 		return fmt.Errorf(`validate "depends_on": %w`, err)
@@ -626,23 +850,98 @@ func (CommandOverride) validate() error {
 	return nil
 }
 
-// validate returns nil if RoutingRuleConfigOrBool is configured correctly.
-func (r RoutingRuleConfigOrBool) validate() error {
+// validate returns nil if HTTP is configured correctly.
+func (r HTTP) validate() error {
+	if r.IsEmpty() {
+		return nil
+	}
+	// we consider the fact that primary routing rule is mandatory before you write any additional routing rules.
+	if err := r.Main.validate(); err != nil {
+		return err
+	}
+	if r.Main.TargetContainer != nil && r.TargetContainerCamelCase != nil {
+		return &errFieldMutualExclusive{
+			firstField:  "target_container",
+			secondField: "targetContainer",
+		}
+	}
+
+	for idx, rule := range r.AdditionalRoutingRules {
+		if err := rule.validate(); err != nil {
+			return fmt.Errorf(`validate "additional_rules[%d]": %w`, idx, err)
+		}
+	}
+	return nil
+}
+
+// validate returns nil if HTTPOrBool is configured correctly.
+func (r HTTPOrBool) validate() error {
 	if r.Disabled() {
 		return nil
 	}
+
+	return r.HTTP.validate()
+}
+
+func (l LoadBalancedWebServiceConfig) validateGracePeriod() error {
+	gracePeriodForALB, err := l.validateGracePeriodForALB()
+	if err != nil {
+		return err
+	}
+	gracePeriodForNLB, err := l.validateGracePeriodForNLB()
+	if err != nil {
+		return err
+	}
+	if gracePeriodForALB && gracePeriodForNLB {
+		return &errGracePeriodsInBothALBAndNLB{
+			errFieldMutualExclusive: errFieldMutualExclusive{
+				firstField:  "http.healthcheck.grace_period",
+				secondField: "nlb.healthcheck.grace_period",
+			},
+		}
+	}
+
+	return nil
+}
+
+// validateGracePeriodForALB validates if ALB has grace period mentioned in their additional listeners rules.
+func (cfg *LoadBalancedWebServiceConfig) validateGracePeriodForALB() (bool, error) {
+	var exist bool
+	if cfg.HTTPOrBool.Main.HealthCheck.Advanced.GracePeriod != nil {
+		exist = true
+	}
+	for idx, rule := range cfg.HTTPOrBool.AdditionalRoutingRules {
+		if rule.HealthCheck.Advanced.GracePeriod != nil {
+			return exist, &errGracePeriodSpecifiedInAdditionalRule{
+				index: idx,
+			}
+		}
+	}
+	return exist, nil
+}
+
+// validateGracePeriodForNLB validates if NLB has grace period mentioned in their additional listeners.
+func (cfg *LoadBalancedWebServiceConfig) validateGracePeriodForNLB() (bool, error) {
+	var exist bool
+	if cfg.NLBConfig.Listener.HealthCheck.GracePeriod != nil {
+		exist = true
+	}
+	for idx, listener := range cfg.NLBConfig.AdditionalListeners {
+		if listener.HealthCheck.GracePeriod != nil {
+			return exist, &errGracePeriodSpecifiedInAdditionalListener{
+				index: idx,
+			}
+		}
+	}
+	return exist, nil
+}
+
+// validate returns nil if HTTP is configured correctly.
+func (r RoutingRule) validate() error {
 	if r.Path == nil {
 		return &errFieldMustBeSpecified{
 			missingField: "path",
 		}
-	}
-	return r.RoutingRuleConfiguration.validate()
-}
-
-// validate returns nil if RoutingRuleConfiguration is configured correctly.
-func (r RoutingRuleConfiguration) validate() error {
-	if r.IsEmpty() {
-		return nil
 	}
 	if err := r.HealthCheck.validate(); err != nil {
 		return fmt.Errorf(`validate "healthcheck": %w`, err)
@@ -650,25 +949,14 @@ func (r RoutingRuleConfiguration) validate() error {
 	if err := r.Alias.validate(); err != nil {
 		return fmt.Errorf(`validate "alias": %w`, err)
 	}
-	if r.TargetContainer != nil && r.TargetContainerCamelCase != nil {
-		return &errFieldMutualExclusive{
-			firstField:  "target_container",
-			secondField: "targetContainer",
-		}
-	}
 	for ind, ip := range r.AllowedSourceIps {
 		if err := ip.validate(); err != nil {
 			return fmt.Errorf(`validate "allowed_source_ips[%d]": %w`, ind, err)
 		}
 	}
 	if r.ProtocolVersion != nil {
-		if !contains(strings.ToUpper(*r.ProtocolVersion), httpProtocolVersions) {
+		if !slices.Contains(httpProtocolVersions, strings.ToUpper(*r.ProtocolVersion)) {
 			return fmt.Errorf(`"version" field value '%s' must be one of %s`, *r.ProtocolVersion, english.WordSeries(httpProtocolVersions, "or"))
-		}
-	}
-	if r.Path == nil {
-		return &errFieldMustBeSpecified{
-			missingField: "path",
 		}
 	}
 	if r.HostedZone != nil && r.Alias.IsEmpty() {
@@ -677,22 +965,14 @@ func (r RoutingRuleConfiguration) validate() error {
 			conditionalFields: []string{"hosted_zone"},
 		}
 	}
-	return nil
-}
-
-// validate returns nil if HealthCheckArgsOrString is configured correctly.
-func (h HealthCheckArgsOrString) validate() error {
-	if h.IsEmpty() {
-		return nil
+	if err := r.validateConditionValuesPerRule(); err != nil {
+		return fmt.Errorf("validate condition values per listener rule: %w", err)
 	}
-	return h.HealthCheckArgs.validate()
+	return nil
 }
 
 // validate returns nil if HTTPHealthCheckArgs is configured correctly.
 func (h HTTPHealthCheckArgs) validate() error {
-	if h.isEmpty() {
-		return nil
-	}
 	return nil
 }
 
@@ -748,16 +1028,8 @@ func (c NetworkLoadBalancerConfiguration) validate() error {
 	if c.IsEmpty() {
 		return nil
 	}
-	if aws.StringValue(c.Port) == "" {
-		return &errFieldMustBeSpecified{
-			missingField: "port",
-		}
-	}
-	if err := validateNLBPort(c.Port); err != nil {
-		return fmt.Errorf(`validate "port": %w`, err)
-	}
-	if err := c.HealthCheck.validate(); err != nil {
-		return fmt.Errorf(`validate "healthcheck": %w`, err)
+	if err := c.Listener.validate(); err != nil {
+		return err
 	}
 	if err := c.Aliases.validate(); err != nil {
 		return fmt.Errorf(`validate "alias": %w`, err)
@@ -768,6 +1040,26 @@ func (c NetworkLoadBalancerConfiguration) validate() error {
 				return fmt.Errorf(`"hosted_zone" is not supported for Network Load Balancer`)
 			}
 		}
+	}
+	for idx, listener := range c.AdditionalListeners {
+		if err := listener.validate(); err != nil {
+			return fmt.Errorf(`validate "additional_listeners[%d]": %w`, idx, err)
+		}
+	}
+	return nil
+}
+
+func (c NetworkLoadBalancerListener) validate() error {
+	if aws.StringValue(c.Port) == "" {
+		return &errFieldMustBeSpecified{
+			missingField: "port",
+		}
+	}
+	if err := validateNLBPort(c.Port); err != nil {
+		return fmt.Errorf(`validate "port": %w`, err)
+	}
+	if err := c.HealthCheck.validate(); err != nil {
+		return fmt.Errorf(`validate "healthcheck": %w`, err)
 	}
 	return nil
 }
@@ -808,6 +1100,11 @@ func (t TaskConfig) validate() error {
 	}
 	if err = t.Storage.validate(); err != nil {
 		return fmt.Errorf(`validate "storage": %w`, err)
+	}
+	for n, v := range t.Variables {
+		if err := v.validate(); err != nil {
+			return fmt.Errorf(`validate %q "variables": %w`, n, err)
+		}
 	}
 	for _, v := range t.Secrets {
 		if err := v.validate(); err != nil {
@@ -1025,13 +1322,25 @@ func (r Range) validate() error {
 	return r.Value.validate()
 }
 
+type errInvalidRange struct {
+	value       string
+	validFormat string
+}
+
+func (e *errInvalidRange) Error() string {
+	return fmt.Sprintf("invalid range value %s: valid format is %s", e.value, e.validFormat)
+}
+
 // validate returns nil if IntRangeBand is configured correctly.
 func (r IntRangeBand) validate() error {
 	str := string(r)
 	minMax := intRangeBandRegexp.FindStringSubmatch(str)
 	// Valid minMax example: ["1-2", "1", "2"]
 	if len(minMax) != 3 {
-		return fmt.Errorf("invalid range value %s. Should be in format of ${min}-${max}", str)
+		return &errInvalidRange{
+			value:       str,
+			validFormat: "${min}-${max}",
+		}
 	}
 	// Guaranteed by intRangeBandRegexp.
 	min, err := strconv.Atoi(minMax[1])
@@ -1058,7 +1367,14 @@ func (r RangeConfig) validate() error {
 			missingField: "min/max",
 		}
 	}
-	min, max := aws.IntValue(r.Min), aws.IntValue(r.Max)
+	min, max, spotFrom := aws.IntValue(r.Min), aws.IntValue(r.Max), aws.IntValue(r.SpotFrom)
+	if min < 0 || max < 0 || spotFrom < 0 {
+		return &errRangeValueLessThanZero{
+			min:      min,
+			max:      max,
+			spotFrom: spotFrom,
+		}
+	}
 	if min <= max {
 		return nil
 	}
@@ -1194,14 +1510,40 @@ func (l Logging) validate() error {
 	if l.IsEmpty() {
 		return nil
 	}
+	if l.EnvFile != nil {
+		envFile := aws.StringValue(l.EnvFile)
+		if filepath.Ext(envFile) != envFileExt {
+			return fmt.Errorf("environment file %s must have a %s file extension", envFile, envFileExt)
+		}
+	}
 	return nil
 }
 
 // validate returns nil if SidecarConfig is configured correctly.
 func (s SidecarConfig) validate() error {
+	if err := s.validateImage(); err != nil {
+		return err
+	}
 	for ind, mp := range s.MountPoints {
 		if err := mp.validate(); err != nil {
 			return fmt.Errorf(`validate "mount_points[%d]": %w`, ind, err)
+		}
+	}
+	_, protocol, err := ParsePortMapping(s.Port)
+	if err != nil {
+		return err
+	}
+	if protocol != nil {
+		protocolVal := aws.StringValue(protocol)
+		var isValidProtocol bool
+		for _, valid := range validContainerProtocols {
+			if strings.EqualFold(protocolVal, valid) {
+				isValidProtocol = true
+				break
+			}
+		}
+		if !isValidProtocol {
+			return fmt.Errorf(`invalid protocol %s; valid protocols include %s`, protocolVal, english.WordSeries(validContainerProtocols, "and"))
 		}
 	}
 	if err := s.HealthCheck.validate(); err != nil {
@@ -1210,7 +1552,22 @@ func (s SidecarConfig) validate() error {
 	if err := s.DependsOn.validate(); err != nil {
 		return fmt.Errorf(`validate "depends_on": %w`, err)
 	}
+	if s.EnvFile != nil {
+		envFile := aws.StringValue(s.EnvFile)
+		if filepath.Ext(envFile) != envFileExt {
+			return fmt.Errorf("environment file %s must have a %s file extension", envFile, envFileExt)
+		}
+	}
 	return s.ImageOverride.validate()
+}
+func (s SidecarConfig) validateImage() error {
+	if s.Image.IsZero() {
+		return fmt.Errorf(`must specify one of "image", "image.build, or "image.location"`)
+	}
+	if err := s.Image.validate(); err != nil {
+		return fmt.Errorf(`validate "image": %w`, err)
+	}
+	return nil
 }
 
 // validate returns nil if SidecarMountPoint is configured correctly.
@@ -1231,6 +1588,19 @@ func (n NetworkConfig) validate() error {
 	if err := n.VPC.validate(); err != nil {
 		return fmt.Errorf(`validate "vpc": %w`, err)
 	}
+	if err := n.Connect.validate(); err != nil {
+		return fmt.Errorf(`validate "connect": %w`, err)
+	}
+	return nil
+}
+
+// validate returns nil if ServiceConnectBoolOrArgs is configured correctly.
+func (s ServiceConnectBoolOrArgs) validate() error {
+	return s.ServiceConnectArgs.validate()
+}
+
+// validate is a no-op for ServiceConnectArgs.
+func (ServiceConnectArgs) validate() error {
 	return nil
 }
 
@@ -1353,7 +1723,14 @@ func (r AppRunnerInstanceConfig) validate() error {
 
 // validate returns nil if RequestDrivenWebServiceHttpConfig is configured correctly.
 func (r RequestDrivenWebServiceHttpConfig) validate() error {
-	return r.HealthCheckConfiguration.validate()
+	if err := r.HealthCheckConfiguration.validate(); err != nil {
+		return err
+	}
+	return r.Private.validate()
+}
+
+func (v VPCEndpoint) validate() error {
+	return nil
 }
 
 // validate returns nil if Observability is configured correctly.
@@ -1361,15 +1738,15 @@ func (o Observability) validate() error {
 	if o.isEmpty() {
 		return nil
 	}
-	for _, validVendor := range TracingValidVendors {
+	for _, validVendor := range tracingValidVendors {
 		if strings.EqualFold(aws.StringValue(o.Tracing), validVendor) {
 			return nil
 		}
 	}
 	return fmt.Errorf("invalid tracing vendor %s: %s %s",
 		aws.StringValue(o.Tracing),
-		english.PluralWord(len(TracingValidVendors), "the valid vendor is", "valid vendors are"),
-		english.WordSeries(TracingValidVendors, "and"))
+		english.PluralWord(len(tracingValidVendors), "the valid vendor is", "valid vendors are"),
+		english.WordSeries(tracingValidVendors, "and"))
 }
 
 // validate returns nil if JobTriggerConfig is configured correctly.
@@ -1399,7 +1776,23 @@ func (p PublishConfig) validate() error {
 
 // validate returns nil if Topic is configured correctly.
 func (t Topic) validate() error {
-	return validatePubSubName(aws.StringValue(t.Name))
+	if err := validatePubSubName(aws.StringValue(t.Name)); err != nil {
+		return err
+	}
+	return t.FIFO.validate()
+}
+
+// validate returns nil if FIFOTopicAdvanceConfigOrBool is configured correctly.
+func (f FIFOTopicAdvanceConfigOrBool) validate() error {
+	if f.IsEmpty() {
+		return nil
+	}
+	return f.Advanced.validate()
+}
+
+// validate returns nil if FIFOTopicAdvanceConfig is configured correctly.
+func (a FIFOTopicAdvanceConfig) validate() error {
+	return nil
 }
 
 // validate returns nil if SubscribeConfig is configured correctly.
@@ -1454,6 +1847,71 @@ func (q SQSQueue) validate() error {
 	if err := q.DeadLetter.validate(); err != nil {
 		return fmt.Errorf(`validate "dead_letter": %w`, err)
 	}
+	return q.FIFO.validate()
+}
+
+// validate returns nil if FIFOAdvanceConfig is configured correctly.
+func (q FIFOAdvanceConfig) validate() error {
+	if q.IsEmpty() {
+		return nil
+	}
+
+	if err := q.validateHighThroughputFIFO(); err != nil {
+		return err
+	}
+	if err := q.validateDeduplicationScope(); err != nil {
+		return err
+	}
+	if err := q.validateFIFOThroughputLimit(); err != nil {
+		return err
+	}
+	if aws.StringValue(q.FIFOThroughputLimit) == sqsFIFOThroughputLimitPerMessageGroupID && aws.StringValue(q.DeduplicationScope) == sqsDeduplicationScopeQueue {
+		return fmt.Errorf(`"throughput_limit" must be set to "perQueue" when "deduplication_scope" is set to "queue"`)
+	}
+	return nil
+}
+
+// validateFIFO returns nil if FIFOAdvanceConfigOrBool is configured correctly.
+func (q FIFOAdvanceConfigOrBool) validate() error {
+	if q.IsEmpty() {
+		return nil
+	}
+	return q.Advanced.validate()
+}
+
+func (q FIFOAdvanceConfig) validateHighThroughputFIFO() error {
+	if q.HighThroughputFifo == nil {
+		return nil
+	}
+	if q.FIFOThroughputLimit != nil {
+		return &errFieldMutualExclusive{
+			firstField:  "high_throughput",
+			secondField: "throughput_limit",
+			mustExist:   false,
+		}
+	}
+
+	if q.DeduplicationScope != nil {
+		return &errFieldMutualExclusive{
+			firstField:  "high_throughput",
+			secondField: "deduplication_scope",
+			mustExist:   false,
+		}
+	}
+	return nil
+}
+
+func (q FIFOAdvanceConfig) validateDeduplicationScope() error {
+	if q.DeduplicationScope != nil && !slices.Contains(validSQSDeduplicationScopeValues, aws.StringValue(q.DeduplicationScope)) {
+		return fmt.Errorf(`validate "deduplication_scope": deduplication scope value must be one of %s`, english.WordSeries(validSQSDeduplicationScopeValues, "or"))
+	}
+	return nil
+}
+
+func (q FIFOAdvanceConfig) validateFIFOThroughputLimit() error {
+	if q.FIFOThroughputLimit != nil && !slices.Contains(validSQSFIFOThroughputLimitValues, aws.StringValue(q.FIFOThroughputLimit)) {
+		return fmt.Errorf(`validate "throughput_limit": fifo throughput limit value must be one of %s`, english.WordSeries(validSQSFIFOThroughputLimitValues, "or"))
+	}
 	return nil
 }
 
@@ -1476,9 +1934,51 @@ func (r OverrideRule) validate() error {
 	return nil
 }
 
+// validate returns nil if Variable is configured correctly.
+func (v Variable) validate() error {
+	if err := v.FromCFN.validate(); err != nil {
+		return fmt.Errorf(`validate "from_cfn": %w`, err)
+	}
+	return nil
+}
+
+// validate returns nil if StringOrFromCFN is configured correctly.
+func (s StringOrFromCFN) validate() error {
+	if s.isEmpty() {
+		return nil
+	}
+	return s.FromCFN.validate()
+}
+
+// validate returns nil if fromCFN is configured correctly.
+func (cfg fromCFN) validate() error {
+	if cfg.isEmpty() {
+		return nil
+	}
+	if len(aws.StringValue(cfg.Name)) == 0 {
+		return errors.New("name cannot be an empty string")
+	}
+	return nil
+}
+
 // validate is a no-op for Secrets.
 func (s Secret) validate() error {
 	return nil
+}
+
+type validateHealthCheckPortsOpts struct {
+	exposedPorts      ExposedPortsIndex
+	mainContainerPort *uint16
+	alb               HTTP
+	nlb               NetworkLoadBalancerConfiguration
+}
+
+type validateExposedPortsOpts struct {
+	mainContainerName string
+	mainContainerPort *uint16
+	alb               *HTTP
+	nlb               *NetworkLoadBalancerConfiguration
+	sidecarConfig     map[string]*SidecarConfig
 }
 
 type validateDependenciesOpts struct {
@@ -1488,24 +1988,55 @@ type validateDependenciesOpts struct {
 	logging           Logging
 }
 
-type containerDependency struct {
-	dependsOn   DependsOn
-	isEssential bool
-}
-
 type validateTargetContainerOpts struct {
 	mainContainerName string
+	mainContainerPort *uint16
 	targetContainer   *string
 	sidecarConfig     map[string]*SidecarConfig
 }
 
 type validateWindowsOpts struct {
+	readOnlyFS *bool
 	efsVolumes map[string]*Volume
 }
 
-type validateARMOpts struct {
-	Spot     *int
-	SpotFrom *int
+func validateHealthCheckPorts(opts validateHealthCheckPortsOpts) error {
+	for _, rule := range opts.alb.RoutingRules() {
+		healthCheckPort := rule.HealthCheckPort(opts.mainContainerPort)
+		if err := validateHealthCheckPort(healthCheckPort, opts.exposedPorts); err != nil {
+			return err
+		}
+	}
+
+	for _, listener := range opts.nlb.NLBListeners() {
+		healthCheckPort, err := listener.HealthCheckPort(opts.mainContainerPort)
+		if err != nil {
+			return err
+		}
+		if err := validateHealthCheckPort(healthCheckPort, opts.exposedPorts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateHealthCheckPort(port uint16, ports ExposedPortsIndex) error {
+	container := ports.ContainerForPort[port]
+	containerPorts := ports.PortsForContainer[container]
+	for _, exposedPort := range containerPorts {
+		if exposedPort.Port != port {
+			continue
+		}
+
+		if !slices.Contains(validHealthCheckProtocols, strings.ToUpper(exposedPort.Protocol)) {
+			return &errHealthCheckPortExposedWithInvalidProtocol{
+				healthCheckPort: port,
+				container:       container,
+				protocol:        exposedPort.Protocol,
+			}
+		}
+	}
+	return nil
 }
 
 func validateTargetContainer(opts validateTargetContainerOpts) error {
@@ -1514,48 +2045,218 @@ func validateTargetContainer(opts validateTargetContainerOpts) error {
 	}
 	targetContainer := aws.StringValue(opts.targetContainer)
 	if targetContainer == opts.mainContainerName {
+		if opts.mainContainerPort == nil {
+			return fmt.Errorf("target container %q doesn't expose a port", targetContainer)
+		}
 		return nil
 	}
 	sidecar, ok := opts.sidecarConfig[targetContainer]
 	if !ok {
-		return fmt.Errorf("target container %s doesn't exist", targetContainer)
+		return fmt.Errorf("target container %q doesn't exist", targetContainer)
 	}
 	if sidecar.Port == nil {
-		return fmt.Errorf("target container %s doesn't expose any port", targetContainer)
+		return fmt.Errorf("target container %q doesn't expose a port", targetContainer)
 	}
 	return nil
 }
 
 func validateContainerDeps(opts validateDependenciesOpts) error {
-	containerDependencies := make(map[string]containerDependency)
-	containerDependencies[opts.mainContainerName] = containerDependency{
-		dependsOn:   opts.imageConfig.DependsOn,
-		isEssential: true,
-	}
-	if !opts.logging.IsEmpty() {
-		containerDependencies[firelensContainerName] = containerDependency{}
-	}
-	for name, config := range opts.sidecarConfig {
-		containerDependencies[name] = containerDependency{
-			dependsOn:   config.DependsOn,
-			isEssential: config.Essential == nil || aws.BoolValue(config.Essential),
-		}
-	}
+	containerDependencies := containerDependencies(opts.mainContainerName, opts.imageConfig, opts.logging, opts.sidecarConfig)
 	if err := validateDepsForEssentialContainers(containerDependencies); err != nil {
 		return err
 	}
 	return validateNoCircularDependencies(containerDependencies)
 }
 
-func validateDepsForEssentialContainers(deps map[string]containerDependency) error {
+func validateDepsForEssentialContainers(deps map[string]ContainerDependency) error {
 	for name, containerDep := range deps {
-		for dep, status := range containerDep.dependsOn {
-			if !deps[dep].isEssential {
+		for dep, status := range containerDep.DependsOn {
+			if !deps[dep].IsEssential {
 				continue
 			}
 			if err := validateEssentialContainerDependency(dep, strings.ToUpper(status)); err != nil {
 				return fmt.Errorf("validate %s container dependencies status: %w", name, err)
 			}
+		}
+	}
+	return nil
+}
+
+type containerNameAndProtocol struct {
+	containerName     string
+	containerProtocol string
+}
+
+func validateExposedPorts(opts validateExposedPortsOpts) error {
+	portExposedTo := make(map[uint16]containerNameAndProtocol)
+
+	if err := validateAndPopulateSidecarContainerPorts(portExposedTo, opts); err != nil {
+		return err
+	}
+	if err := validateAndPopulateALBPorts(portExposedTo, opts); err != nil {
+		return err
+	}
+	if err := validateAndPopulateNLBPorts(portExposedTo, opts); err != nil {
+		return err
+	}
+	if err := validateAndPopulateMainContainerPort(portExposedTo, opts); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateAndPopulateMainContainerPort(portExposedTo map[uint16]containerNameAndProtocol, opts validateExposedPortsOpts) error {
+	if opts.mainContainerPort == nil {
+		return nil
+	}
+
+	targetPort := aws.Uint16Value(opts.mainContainerPort)
+	targetProtocol := defaultProtocol
+	if existingContainerNameAndProtocol, ok := portExposedTo[targetPort]; ok {
+		targetProtocol = existingContainerNameAndProtocol.containerProtocol
+	}
+
+	return validateAndPopulateExposedPortMapping(portExposedTo, targetPort, targetProtocol, opts.mainContainerName)
+}
+
+func validateAndPopulateSidecarContainerPorts(portExposedTo map[uint16]containerNameAndProtocol, opts validateExposedPortsOpts) error {
+	for name, sidecar := range opts.sidecarConfig {
+		if sidecar.Port == nil {
+			continue
+		}
+		sidecarPort, sidecarProtocol, err := ParsePortMapping(sidecar.Port)
+		if err != nil {
+			return err
+		}
+		parsedPort, err := strconv.ParseUint(aws.StringValue(sidecarPort), 10, 16)
+		if err != nil {
+			return err
+		}
+		protocol := defaultProtocol
+		if sidecarProtocol != nil {
+			protocol = aws.StringValue(sidecarProtocol)
+		}
+
+		if err = validateAndPopulateExposedPortMapping(portExposedTo, uint16(parsedPort), protocol, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAndPopulateALBPorts(portExposedTo map[uint16]containerNameAndProtocol, opts validateExposedPortsOpts) error {
+	if opts.alb == nil || opts.alb.IsEmpty() {
+		return nil
+	}
+
+	alb := opts.alb
+	for _, rule := range alb.RoutingRules() {
+		if rule.TargetPort == nil {
+			continue
+		}
+		targetPort := aws.Uint16Value(rule.TargetPort)
+
+		// Prefer `http.target_container`, then existing exposed port mapping, then fallback on name of main container
+		targetContainer := opts.mainContainerName
+		if existingContainerNameAndProtocol, ok := portExposedTo[targetPort]; ok {
+			targetContainer = existingContainerNameAndProtocol.containerName
+		}
+		if rule.TargetContainer != nil {
+			targetContainer = aws.StringValue(rule.TargetContainer)
+		}
+
+		if err := validateAndPopulateExposedPortMapping(portExposedTo, targetPort, TCP, targetContainer); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAndPopulateNLBPorts(portExposedTo map[uint16]containerNameAndProtocol, opts validateExposedPortsOpts) error {
+	if opts.nlb == nil || opts.nlb.IsEmpty() {
+		return nil
+	}
+
+	nlb := opts.nlb
+	if err := validateAndPopulateNLBListenerPorts(nlb.Listener, portExposedTo, opts.mainContainerName); err != nil {
+		return fmt.Errorf(`validate "nlb": %w`, err)
+	}
+
+	for idx, listener := range nlb.AdditionalListeners {
+		if err := validateAndPopulateNLBListenerPorts(listener, portExposedTo, opts.mainContainerName); err != nil {
+			return fmt.Errorf(`validate "nlb.additional_listeners[%d]": %w`, idx, err)
+		}
+	}
+	return nil
+}
+
+func validateAndPopulateNLBListenerPorts(listener NetworkLoadBalancerListener, portExposedTo map[uint16]containerNameAndProtocol, mainContainerName string) error {
+	nlbReceiverPort, nlbProtocol, err := ParsePortMapping(listener.Port)
+	if err != nil {
+		return err
+	}
+
+	port, err := strconv.ParseUint(aws.StringValue(nlbReceiverPort), 10, 16)
+	if err != nil {
+		return err
+	}
+
+	targetPort := uint16(port)
+	if listener.TargetPort != nil {
+		targetPort = uint16(aws.IntValue(listener.TargetPort))
+	}
+
+	// Prefer `nlb.port`, then fallback on default protocol
+	targetProtocol := defaultProtocol
+	if nlbProtocol != nil {
+		targetProtocol = strings.ToUpper(aws.StringValue(nlbProtocol))
+	}
+
+	// Handle TLS termination of container exposed port protocol
+	if targetProtocol == TLS {
+		targetProtocol = TCP
+	}
+
+	// Prefer `nlb.target_container`, then existing exposed port mapping, then fallback on name of main container
+	targetContainer := mainContainerName
+	if existingContainerNameAndProtocol, ok := portExposedTo[targetPort]; ok {
+		targetContainer = existingContainerNameAndProtocol.containerName
+	}
+	if listener.TargetContainer != nil {
+		targetContainer = aws.StringValue(listener.TargetContainer)
+	}
+
+	return validateAndPopulateExposedPortMapping(portExposedTo, targetPort, targetProtocol, targetContainer)
+}
+
+func validateAndPopulateExposedPortMapping(portExposedTo map[uint16]containerNameAndProtocol, targetPort uint16, targetProtocol string, targetContainer string) error {
+	exposedContainerAndProtocol, alreadyExposed := portExposedTo[targetPort]
+	targetProtocol = strings.ToUpper(targetProtocol)
+
+	// Port is not associated with container and protocol, populate map
+	if !alreadyExposed {
+		portExposedTo[targetPort] = containerNameAndProtocol{
+			containerName:     targetContainer,
+			containerProtocol: targetProtocol,
+		}
+		return nil
+	}
+
+	exposedContainer := exposedContainerAndProtocol.containerName
+	exposedProtocol := exposedContainerAndProtocol.containerProtocol
+	if exposedContainer != targetContainer {
+		return &errContainersExposingSamePort{
+			firstContainer:  targetContainer,
+			secondContainer: exposedContainer,
+			port:            targetPort,
+		}
+	}
+	if exposedProtocol != targetProtocol {
+		return &errContainerPortExposedWithMultipleProtocol{
+			container:      exposedContainer,
+			port:           targetPort,
+			firstProtocol:  targetProtocol,
+			secondProtocol: exposedProtocol,
 		}
 	}
 	return nil
@@ -1570,7 +2271,7 @@ func validateEssentialContainerDependency(name, status string) error {
 	return fmt.Errorf("essential container %s can only have status %s", name, english.WordSeries([]string{dependsOnStart, dependsOnHealthy}, "or"))
 }
 
-func validateNoCircularDependencies(deps map[string]containerDependency) error {
+func validateNoCircularDependencies(deps map[string]ContainerDependency) error {
 	dependencies, err := buildDependencyGraph(deps)
 	if err != nil {
 		return err
@@ -1587,10 +2288,10 @@ func validateNoCircularDependencies(deps map[string]containerDependency) error {
 	return fmt.Errorf("circular container dependency chain includes the following containers: %s", cycle)
 }
 
-func buildDependencyGraph(deps map[string]containerDependency) (*graph.Graph[string], error) {
+func buildDependencyGraph(deps map[string]ContainerDependency) (*graph.Graph[string], error) {
 	dependencyGraph := graph.New[string]()
 	for name, containerDep := range deps {
-		for dep := range containerDep.dependsOn {
+		for dep := range containerDep.DependsOn {
 			if _, ok := deps[dep]; !ok {
 				return nil, fmt.Errorf("container %s does not exist", dep)
 			}
@@ -1622,9 +2323,9 @@ func validatePubSubName(name string) error {
 			missingField: "name",
 		}
 	}
-	// Name must contain letters, numbers, and can't use special characters besides underscores and hyphens.
+	// Name must contain letters, numbers, and can't use special characters besides underscores, and hyphens.
 	if !awsSNSTopicRegexp.MatchString(name) {
-		return fmt.Errorf(`"name" can only contain letters, numbers, underscores, and hypthens`)
+		return fmt.Errorf(`"name" can only contain letters, numbers, underscores, and hyphens`)
 	}
 	return nil
 }
@@ -1645,6 +2346,9 @@ func isValidSubSvcName(name string) bool {
 }
 
 func validateWindows(opts validateWindowsOpts) error {
+	if aws.BoolValue(opts.readOnlyFS) {
+		return fmt.Errorf(`%q can not be set to 'true' when deploying a Windows container`, "readonly_fs")
+	}
 	for _, volume := range opts.efsVolumes {
 		if !volume.EmptyVolume() {
 			return errors.New(`'EFS' is not supported when deploying a Windows container`)
@@ -1653,18 +2357,138 @@ func validateWindows(opts validateWindowsOpts) error {
 	return nil
 }
 
-func validateARM(opts validateARMOpts) error {
-	if opts.Spot != nil || opts.SpotFrom != nil {
-		return errors.New(`'Fargate Spot' is not supported when deploying on ARM architecture`)
+// validate returns nil if ImageLocationOrBuild is configured correctly.
+func (i ImageLocationOrBuild) validate() error {
+	if err := i.Build.validate(); err != nil {
+		return fmt.Errorf(`validate "build": %w`, err)
+	}
+	if i.Build.isEmpty() == (i.Location == nil) {
+		return &errFieldMutualExclusive{
+			firstField:  "build",
+			secondField: "location",
+			mustExist:   true,
+		}
 	}
 	return nil
 }
 
-func contains(name string, names []string) bool {
-	for _, n := range names {
-		if name == n {
-			return true
+func (r *RoutingRule) validateConditionValuesPerRule() error {
+	aliases, err := r.Alias.ToStringSlice()
+	if err != nil {
+		return fmt.Errorf("convert aliases to string slice: %w", err)
+	}
+	allowedSourceIps := make([]string, len(r.AllowedSourceIps))
+	for idx, ip := range r.AllowedSourceIps {
+		allowedSourceIps[idx] = string(ip)
+	}
+	if len(aliases)+len(allowedSourceIps) >= maxConditionsPerRule {
+		return &errMaxConditionValuesPerRule{
+			path:             aws.StringValue(r.Path),
+			aliases:          aliases,
+			allowedSourceIps: allowedSourceIps,
 		}
 	}
-	return false
+	return nil
+}
+
+type errMaxConditionValuesPerRule struct {
+	path             string
+	aliases          []string
+	allowedSourceIps []string
+}
+
+func (e *errMaxConditionValuesPerRule) Error() string {
+	return fmt.Sprintf("listener rule has more than five conditions %s %s", english.WordSeries(e.aliases, "and"),
+		english.WordSeries(e.allowedSourceIps, "and"))
+}
+
+func (e *errMaxConditionValuesPerRule) RecommendActions() string {
+	cgList := e.generateConditionGroups()
+	var fmtListenerRules strings.Builder
+	fmtListenerRules.WriteString(fmt.Sprintf(`http:
+  path: %s
+  alias: %s
+  allowed_source_ips: %s
+  additional_rules:`, e.path, fmtStringArray(cgList[0].aliases), fmtStringArray(cgList[0].allowedSourceIps)))
+	for i := 1; i < len(cgList); i++ {
+		fmtListenerRules.WriteString(fmt.Sprintf(`
+    - path: %s
+      alias: %s
+      allowed_source_ips: %s`, e.path, fmtStringArray(cgList[i].aliases), fmtStringArray(cgList[i].allowedSourceIps)))
+	}
+	return fmt.Sprintf(`You can split the "alias" and "allowed_source_ips" field into separate rules, so that each rule contains up to 5 values: 
+%s`, color.HighlightCodeBlock(fmtListenerRules.String()))
+}
+
+func fmtStringArray(arr []string) string {
+	return fmt.Sprintf("[%s]", strings.Join(arr, ","))
+}
+
+// conditionGroup represents groups of conditions per listener rule.
+type conditionGroup struct {
+	allowedSourceIps []string
+	aliases          []string
+}
+
+func (e *errMaxConditionValuesPerRule) generateConditionGroups() []conditionGroup {
+	remaining := calculateRemainingConditions(e.path)
+	if len(e.aliases) != 0 && len(e.allowedSourceIps) != 0 {
+		return e.generateConditionsWithSourceIPsAndAlias(remaining)
+	}
+	if len(e.aliases) != 0 {
+		return e.generateConditionsWithAliasOnly(remaining)
+	}
+	return e.generateConditionWithSourceIPsOnly(remaining)
+}
+
+func calculateRemainingConditions(path string) int {
+	rcPerRule := maxConditionsPerRule
+	if path != rootPath {
+		return rcPerRule - 2
+	}
+	return rcPerRule - 1
+}
+
+func (e *errMaxConditionValuesPerRule) generateConditionsWithSourceIPsAndAlias(remaining int) []conditionGroup {
+	var groups []conditionGroup
+	for i := 0; i < len(e.allowedSourceIps); i++ {
+		var group conditionGroup
+		group.allowedSourceIps = []string{e.allowedSourceIps[i]}
+		groups = append(groups, e.generateConditionsGroups(remaining-1, true, group)...)
+	}
+	return groups
+}
+
+func (e *errMaxConditionValuesPerRule) generateConditionsWithAliasOnly(remaining int) []conditionGroup {
+	var group conditionGroup
+	return e.generateConditionsGroups(remaining, true, group)
+}
+
+func (e *errMaxConditionValuesPerRule) generateConditionWithSourceIPsOnly(remaining int) []conditionGroup {
+	var group conditionGroup
+	return e.generateConditionsGroups(remaining, false, group)
+}
+
+func (e *errMaxConditionValuesPerRule) generateConditionsGroups(remaining int, isAlias bool, group conditionGroup) []conditionGroup {
+	var groups []conditionGroup
+	var conditions []string
+	if isAlias {
+		conditions = e.aliases
+	} else {
+		conditions = e.allowedSourceIps
+	}
+	for i := 0; i < len(conditions); i += remaining {
+		end := i + remaining
+		if end > len(conditions) {
+			end = len(conditions)
+		}
+		if isAlias {
+			group.aliases = conditions[i:end]
+			groups = append(groups, group)
+			continue
+		}
+		group.allowedSourceIps = conditions[i:end]
+		groups = append(groups, group)
+	}
+	return groups
 }

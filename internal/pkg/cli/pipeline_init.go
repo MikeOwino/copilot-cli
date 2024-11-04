@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
@@ -83,6 +85,10 @@ const (
 )
 
 var pipelineTypes = []string{pipelineTypeWorkloads, pipelineTypeEnvironments}
+
+var buildspecTemplateFunctions = map[string]interface{}{
+	"URLSafeVersion": template.URLSafeVersion,
+}
 
 var (
 	// Filled in via the -ldflags flag at compile time to support pipeline buildspec CLI pulling.
@@ -200,7 +206,6 @@ type initPipelineOpts struct {
 
 	// Cached variables
 	wsAppName    string
-	fs           *afero.Afero
 	buffer       bytes.Buffer
 	envConfigs   []*config.Environment
 	manifestPath string // relative path to pipeline's manifest.yml file
@@ -213,9 +218,9 @@ type artifactBucket struct {
 }
 
 func newInitPipelineOpts(vars initPipelineVars) (*initPipelineOpts, error) {
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace client: %w", err)
+		return nil, err
 	}
 
 	p := sessions.ImmutableProvider(sessions.UserAgentExtras("pipeline init"))
@@ -238,12 +243,11 @@ func newInitPipelineOpts(vars initPipelineVars) (*initPipelineOpts, error) {
 		secretsmanager:   secretsmanager.New(defaultSession),
 		parser:           template.New(),
 		sessProvider:     p,
-		cfnClient:        cloudformation.New(defaultSession),
+		cfnClient:        cloudformation.New(defaultSession, cloudformation.WithProgressTracker(os.Stderr)),
 		store:            ssmStore,
 		prompt:           prompter,
 		sel:              selector.NewAppEnvSelector(prompter, ssmStore),
 		runner:           exec.NewCmd(),
-		fs:               &afero.Afero{Fs: afero.NewOsFs()},
 		wsAppName:        wsAppName,
 		pipelineLister:   deploy.NewPipelineStore(rg.New(defaultSession)),
 	}, nil
@@ -410,7 +414,7 @@ func (o *initPipelineOpts) askOrValidatePipelineType() error {
 				return nil
 			}
 		}
-		return fmt.Errorf("invalid pipeline type %q; must be one of %s", o.pipelineType, english.WordSeries(quoteStringSlice(pipelineTypes), "or"))
+		return fmt.Errorf("invalid pipeline type %q; must be one of %s", o.pipelineType, english.WordSeries(applyAll(pipelineTypes, strconv.Quote), "or"))
 	}
 
 	typ, err := o.prompt.SelectOption("What type of continuous delivery pipeline is this?",
@@ -780,7 +784,7 @@ func (o *initPipelineOpts) createBuildspec(buildSpecTemplatePath string) error {
 		Version:            version.Version,
 		ManifestPath:       filepath.ToSlash(o.manifestPath), // The manifest path must be rendered in the buildspec with '/' instead of os-specific separator.
 		ArtifactBuckets:    artifactBuckets,
-	})
+	}, template.WithFuncs(buildspecTemplateFunctions))
 	if err != nil {
 		return err
 	}

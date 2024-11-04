@@ -6,7 +6,7 @@
 package stack_test
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -34,8 +34,28 @@ func TestGHPipeline_Template(t *testing.T) {
 		ManagerRoleARN:   "arn:aws:iam::1111:role/phonetool-test-EnvManagerRole",
 	}, &manifest.PipelineStage{
 		Name:             "test",
-		TestCommands:     []string{`echo "test"`},
 		RequiresApproval: true,
+		PreDeployments: map[string]*manifest.PrePostDeployment{
+			"preAction1": {
+				BuildspecPath: "./buildspec.yml",
+			},
+			"preAction2": {
+				BuildspecPath: "copilot/pipelines/buildspec.yml",
+				DependsOn:     []string{"preAction1"},
+			},
+		},
+		PostDeployments: map[string]*manifest.PrePostDeployment{
+			"postAction1": {
+				BuildspecPath: ".anotherPath/buildspec.yml",
+			},
+			"postAction2": {
+				BuildspecPath: ".somePath/buildspec.yml",
+				DependsOn:     []string{"postAction1"},
+			},
+			"postAction3": {
+				BuildspecPath: ".someOtherPath/buildspec.yml",
+			},
+		},
 	}, []string{"api", "frontend"})
 	ps := stack.NewPipelineStackConfig(&deploy.CreatePipelineInput{
 		AppName: "phonetool",
@@ -54,6 +74,7 @@ func TestGHPipeline_Template(t *testing.T) {
 			},
 		},
 		AdditionalTags: nil,
+		Version:        "v1.28.0",
 	})
 
 	actual, err := ps.Template()
@@ -62,7 +83,7 @@ func TestGHPipeline_Template(t *testing.T) {
 	m1 := make(map[interface{}]interface{})
 	require.NoError(t, yaml.Unmarshal(actualInBytes, m1))
 
-	wanted, err := ioutil.ReadFile(filepath.Join("testdata", "pipeline", "gh_template.yaml"))
+	wanted, err := os.ReadFile(filepath.Join("testdata", "pipeline", "gh_template.yaml"))
 	require.NoError(t, err, "should be able to read expected template file")
 	wantedInBytes := []byte(wanted)
 	m2 := make(map[interface{}]interface{})
